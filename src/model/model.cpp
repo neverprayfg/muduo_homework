@@ -14,6 +14,7 @@ int getTokenIndex(const char* str, CTokenIndex* vocabSortedList, int vocabSize) 
     return res != nullptr ? res->id : -1;
 }
 void CModel::encode(CTokenizer* tokenizer, std::string text, int8_t bos, int8_t eos, int* tokens, int* numTokens) {
+    std::cerr << "[TRACE] encode begin\n";
     if (text.empty()) {
         std::cerr<<"[ERROR:] Text input is empty and cannot be processed.\n"<<std::endl;
         exit(EXIT_FAILURE);
@@ -110,6 +111,7 @@ void CModel::encode(CTokenizer* tokenizer, std::string text, int8_t bos, int8_t 
     if (eos) tokens[(*numTokens)++] = 2;
 
     free(strBuffer);
+    std::cerr << "[TRACE] encode end nTokens=" << *numTokens << "\n";
 }
 
 char* CModel::decode(CTokenizer* tokenizer, int previousToken, int token) {
