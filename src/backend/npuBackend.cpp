@@ -8,7 +8,6 @@
 #include "npuBackend.hpp"
 #include "aclnnop/aclnn_add.h"
 #include "aclnnop/aclnn_mul.h"
-#include "aclnnop/aclnn_muls.h"
 #include "aclnnop/aclnn_matmul.h"
 #include "aclnnop/aclnn_sigmoid.h"
 #include "aclnnop/aclnn_softmax.h"
