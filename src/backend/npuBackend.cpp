@@ -8,7 +8,6 @@
 #include "npuBackend.hpp"
 #include "aclnnop/aclnn_add.h"
 #include "aclnnop/aclnn_mul.h"
-#include "aclnnop/aclnn_muls.h"
 #include "aclnnop/aclnn_matmul.h"
 #include "aclnnop/aclnn_sigmoid.h"
 #include "aclnnop/aclnn_softmax.h"
@@ -152,13 +151,14 @@ static void RunAclnnTwoStage(uint64_t workspaceSize,
     }
 }
 
-static void RunAclnnInplaceMuls(aclTensor* tensor,
-                                aclScalar* scalar,
-                                aclrtStream stream) {
+static void RunAclnnMulTensor(aclTensor* lhs,
+                              aclTensor* rhs,
+                              aclTensor* out,
+                              aclrtStream stream) {
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor = nullptr;
-    ACL_CHECK(aclnnInplaceMulsGetWorkspaceSize(tensor, scalar, &workspaceSize, &executor));
-    RunAclnnTwoStage(workspaceSize, executor, stream, aclnnInplaceMuls);
+    ACL_CHECK(aclnnMulGetWorkspaceSize(lhs, rhs, out, &workspaceSize, &executor));
+    RunAclnnTwoStage(workspaceSize, executor, stream, aclnnMul);
 }
 
 static void RunAclnnMatmulTensor(aclTensor* lhs,
@@ -477,33 +477,44 @@ void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, fl
     int64_t outShape[2] = {1, headSize};
 
     void* rawScoreAddr = nullptr;
+    void* scaledScoreAddr = nullptr;
+    void* scaleAddr = nullptr;
     ACL_CHECK(aclrtMalloc(&rawScoreAddr, seqLen * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST));
+    ACL_CHECK(aclrtMalloc(&scaledScoreAddr, seqLen * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST));
+    ACL_CHECK(aclrtMalloc(&scaleAddr, seqLen * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST));
+
+    const float scaleValue = 1.0f / std::sqrt(static_cast<float>(headSize));
+    std::vector<float> scaleHost(seqLen, scaleValue);
+    ACL_CHECK(aclrtMemcpy(scaleAddr, seqLen * sizeof(float),
+                          scaleHost.data(), seqLen * sizeof(float),
+                          ACL_MEMCPY_HOST_TO_DEVICE));
 
     aclTensor* qTensor = CreateTensorFromDevice(q, qShape, 2, ACL_FLOAT);
     aclTensor* kTensor = CreateTensorFromDeviceWithStrides(kCache, kViewShape, kStrides,
                                                            kStorageShape, 2, ACL_FLOAT);
     aclTensor* rawScoreTensor = CreateTensorFromDevice(rawScoreAddr, scoreShape, 2, ACL_FLOAT);
+    aclTensor* scaledScoreTensor = CreateTensorFromDevice(scaledScoreAddr, scoreShape, 2, ACL_FLOAT);
+    aclTensor* scaleTensor = CreateTensorFromDevice(scaleAddr, scoreShape, 2, ACL_FLOAT);
     aclTensor* scoreTensor = CreateTensorFromDevice(attnScores, scoreShape, 2, ACL_FLOAT);
     aclTensor* vTensor = CreateTensorFromDevice(vCache, vShape, 2, ACL_FLOAT);
     aclTensor* outTensor = CreateTensorFromDevice(out, outShape, 2, ACL_FLOAT);
 
     RunAclnnMatmulTensor(qTensor, kTensor, rawScoreTensor, pImpl->stream_);
-
-    const float scaleValue = 1.0f / std::sqrt(static_cast<float>(headSize));
-    aclScalar* scale = aclCreateScalar(&scaleValue, ACL_FLOAT);
-    RunAclnnInplaceMuls(rawScoreTensor, scale, pImpl->stream_);
-    aclDestroyScalar(scale);
-
-    RunAclnnSoftmaxTensor(rawScoreTensor, 1, scoreTensor, pImpl->stream_);
+    RunAclnnMulTensor(rawScoreTensor, scaleTensor, scaledScoreTensor, pImpl->stream_);
+    RunAclnnSoftmaxTensor(scaledScoreTensor, 1, scoreTensor, pImpl->stream_);
     RunAclnnMatmulTensor(scoreTensor, vTensor, outTensor, pImpl->stream_);
 
     aclDestroyTensor(qTensor);
     aclDestroyTensor(kTensor);
     aclDestroyTensor(rawScoreTensor);
+    aclDestroyTensor(scaledScoreTensor);
+    aclDestroyTensor(scaleTensor);
     aclDestroyTensor(scoreTensor);
     aclDestroyTensor(vTensor);
     aclDestroyTensor(outTensor);
     ACL_CHECK(aclrtFree(rawScoreAddr));
+    ACL_CHECK(aclrtFree(scaledScoreAddr));
+    ACL_CHECK(aclrtFree(scaleAddr));
 }
 
 void* CNPUBackend::allocMemory(size_t size) {
