@@ -6,3 +6,7 @@ CTokenIndex::CTokenIndex(const char* initToken) : id(0)
 {
     token = initToken;
 }
+
+CTokenIndex::~CTokenIndex()
+{
+}

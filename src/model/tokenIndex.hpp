@@ -11,6 +11,7 @@ public:
 
     CTokenIndex();  
     CTokenIndex(const char* initToken); 
+    ~CTokenIndex();
 };
 
 #endif
