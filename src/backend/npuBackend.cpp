@@ -589,7 +589,7 @@ void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, fl
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor = nullptr;
     constexpr int64_t numHeads = 1;
-    constexpr int64_t numKeyValueHeads = 0;
+    constexpr int64_t numKeyValueHeads = 1;
     const double scaleValue = 1.0 / std::sqrt(static_cast<double>(headSize));
     char inputLayout[] = "BNSD";
     ACL_CHECK(aclnnIncreFlashAttentionGetWorkspaceSize(qHalfTensor, keyTensorList, valueTensorList,
