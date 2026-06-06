@@ -400,16 +400,19 @@ void CNPUBackend::addRmsNorm(float* y, float* xOut, float* x1, float* x2, float*
 
     int64_t xShape[2] = {1, n};
     int64_t wShape[1] = {n};
-    int64_t rstdShape[1] = {1};
+    int64_t rstdShape[2] = {1, 1};
 
     aclTensor* x1Tensor = CreateTensorFromDevice(x1, xShape, 2, ACL_FLOAT);
     aclTensor* x2Tensor = CreateTensorFromDevice(x2, xShape, 2, ACL_FLOAT);
     aclTensor* wTensor = CreateTensorFromDevice(w, wShape, 1, ACL_FLOAT);
     aclTensor* yTensor = CreateTensorFromDevice(y, xShape, 2, ACL_FLOAT);
-    aclTensor* xOutTensor = CreateTensorFromDevice(xOut, xShape, 2, ACL_FLOAT);
+
+    const bool xOutAliasesInput = (xOut == x1 || xOut == x2);
+    void* realXOut = xOutAliasesInput ? GetTempBuffer(pImpl, 8, n * sizeof(float)) : xOut;
+    aclTensor* xOutTensor = CreateTensorFromDevice(realXOut, xShape, 2, ACL_FLOAT);
 
     void* rstdAddr = GetTempBuffer(pImpl, 0, sizeof(float));
-    aclTensor* rstdTensor = CreateTensorFromDevice(rstdAddr, rstdShape, 1, ACL_FLOAT);
+    aclTensor* rstdTensor = CreateTensorFromDevice(rstdAddr, rstdShape, 2, ACL_FLOAT);
 
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor = nullptr;
@@ -418,6 +421,11 @@ void CNPUBackend::addRmsNorm(float* y, float* xOut, float* x1, float* x2, float*
                                               yTensor, rstdTensor, xOutTensor,
                                               &workspaceSize, &executor));
     RunAclnnTwoStage(pImpl, workspaceSize, executor, pImpl->stream_, aclnnAddRmsNorm);
+    if (xOutAliasesInput) {
+        ACL_CHECK(aclrtMemcpy(xOut, n * sizeof(float),
+                              realXOut, n * sizeof(float),
+                              ACL_MEMCPY_DEVICE_TO_DEVICE));
+    }
 
     aclDestroyTensor(x1Tensor);
     aclDestroyTensor(x2Tensor);
