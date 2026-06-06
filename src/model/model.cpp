@@ -40,7 +40,9 @@ void CModel::encode(CTokenizer* tokenizer, std::string text, int8_t bos, int8_t 
     
     if (text[0] != '\0') {
         int dummyPrefix = getTokenIndex(" ", tokenizer->vocabSortedList, tokenizer->vocabSize);
-        tokens[(*numTokens)++] = dummyPrefix;
+        if (dummyPrefix != -1) {
+            tokens[(*numTokens)++] = dummyPrefix;
+        }
     }
 
     for (size_t i = 0; i < text.size(); ++i) {
@@ -76,7 +78,16 @@ void CModel::encode(CTokenizer* tokenizer, std::string text, int8_t bos, int8_t 
         int bestIdx = -1;
 
         for (int i = 0; i < (*numTokens - 1); i++) {
-            sprintf(strBuffer, "%s%s", tokenizer->vocab[tokens[i]], tokenizer->vocab[tokens[i + 1]]);
+            if (tokens[i] < 0 || tokens[i] >= tokenizer->vocabSize ||
+                tokens[i + 1] < 0 || tokens[i + 1] >= tokenizer->vocabSize) {
+                continue;
+            }
+
+            snprintf(strBuffer,
+                     tokenizer->maxTokenLength * 2 + 1 + 2,
+                     "%s%s",
+                     tokenizer->vocab[tokens[i]],
+                     tokenizer->vocab[tokens[i + 1]]);
             int id = getTokenIndex(strBuffer, tokenizer->vocabSortedList, tokenizer->vocabSize);
             if (id != -1 && tokenizer->vocabScores[id] > bestScore) {
                 bestScore = tokenizer->vocabScores[id];

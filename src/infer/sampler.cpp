@@ -75,7 +75,7 @@ int TopPSample(float* probabilities, int size, float topP, Candidate* candidates
 void CSampler::initializeSampler(int vocabSize, float temperature, float ttopP, unsigned long long rngSeed) {
     this->vocabSize = vocabSize;
     this->temperature = temperature;
-    this->topP = topP;
+    this->topP = ttopP;
     this->rngState = rngSeed;
     this->candidates = new Candidate[this->vocabSize];
 }

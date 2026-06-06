@@ -97,7 +97,7 @@ std::tuple<std::string, int, long> CInfer::generate(std::string prompt) {
 
     long start = 0;      
     long end = 0;        
-    long elapsed;
+    long elapsed = 0;
     int next;                    
     int token = promptTokens[0]; 
     int pos = 0;               
