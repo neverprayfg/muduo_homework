@@ -8,9 +8,11 @@
 #include "npuBackend.hpp"
 #include "aclnnop/aclnn_add.h"
 #include "aclnnop/aclnn_mul.h"
+#include "aclnnop/aclnn_muls.h"
 #include "aclnnop/aclnn_matmul.h"
 #include "aclnnop/aclnn_sigmoid.h"
 #include "aclnnop/aclnn_softmax.h"
+#include "aclnnop/aclnn_rotary_position_embedding.h"
 
 
 #define ACL_CHECK(call) {                                   \
@@ -43,7 +45,7 @@ struct CNPUBackend::Impl {
     struct RopeCacheEntry {
         void* cosAddr{nullptr};
         void* sinAddr{nullptr};
-        int pairCount{0};
+        int elemCount{0};
     };
     std::unordered_map<uint64_t, RopeCacheEntry> ropeCache_;
 };
@@ -150,27 +152,6 @@ static void RunAclnnTwoStage(uint64_t workspaceSize,
     }
 }
 
-static void RunAclnnMulTensor(aclTensor* lhs,
-                              aclTensor* rhs,
-                              aclTensor* out,
-                              aclrtStream stream) {
-    uint64_t workspaceSize = 0;
-    aclOpExecutor* executor = nullptr;
-    ACL_CHECK(aclnnMulGetWorkspaceSize(lhs, rhs, out, &workspaceSize, &executor));
-    RunAclnnTwoStage(workspaceSize, executor, stream, aclnnMul);
-}
-
-static void RunAclnnAddTensor(aclTensor* lhs,
-                              aclTensor* rhs,
-                              aclScalar* alpha,
-                              aclTensor* out,
-                              aclrtStream stream) {
-    uint64_t workspaceSize = 0;
-    aclOpExecutor* executor = nullptr;
-    ACL_CHECK(aclnnAddGetWorkspaceSize(lhs, rhs, alpha, out, &workspaceSize, &executor));
-    RunAclnnTwoStage(workspaceSize, executor, stream, aclnnAdd);
-}
-
 static void RunAclnnInplaceMuls(aclTensor* tensor,
                                 aclScalar* scalar,
                                 aclrtStream stream) {
@@ -202,37 +183,53 @@ static void RunAclnnSoftmaxTensor(aclTensor* input,
     RunAclnnTwoStage(workspaceSize, executor, stream, aclnnSoftmax);
 }
 
-static uint64_t MakeRopeCacheKey(int headSize, int position, int pairCount) {
+static void RunAclnnRotaryPositionEmbedding(aclTensor* x,
+                                            aclTensor* cos,
+                                            aclTensor* sin,
+                                            aclTensor* out,
+                                            aclrtStream stream) {
+    uint64_t workspaceSize = 0;
+    aclOpExecutor* executor = nullptr;
+    constexpr int64_t mode = 1; // interleave
+    ACL_CHECK(aclnnRotaryPositionEmbeddingGetWorkspaceSize(x, cos, sin, mode, out,
+                                                           &workspaceSize, &executor));
+    RunAclnnTwoStage(workspaceSize, executor, stream, aclnnRotaryPositionEmbedding);
+}
+
+static uint64_t MakeRopeCacheKey(int headSize, int position, int elemCount) {
     return (static_cast<uint64_t>(static_cast<uint32_t>(headSize)) << 40) |
            (static_cast<uint64_t>(static_cast<uint32_t>(position)) << 16) |
-           static_cast<uint64_t>(static_cast<uint16_t>(pairCount));
+           static_cast<uint64_t>(static_cast<uint16_t>(elemCount));
 }
 
 static CNPUBackend::Impl::RopeCacheEntry& GetRopeCacheEntry(CNPUBackend::Impl* impl,
                                                             int headSize,
                                                             int position,
-                                                            int pairCount) {
-    const uint64_t key = MakeRopeCacheKey(headSize, position, pairCount);
+                                                            int elemCount) {
+    const uint64_t key = MakeRopeCacheKey(headSize, position, elemCount);
     auto it = impl->ropeCache_.find(key);
     if (it != impl->ropeCache_.end()) {
         return it->second;
     }
 
     CNPUBackend::Impl::RopeCacheEntry entry;
-    entry.pairCount = pairCount;
+    entry.elemCount = elemCount;
 
-    std::vector<float> cosHost(pairCount);
-    std::vector<float> sinHost(pairCount);
-    for (int pairIdx = 0; pairIdx < pairCount; ++pairIdx) {
-        const int i = pairIdx * 2;
+    std::vector<float> cosHost(elemCount);
+    std::vector<float> sinHost(elemCount);
+    for (int i = 0; i < elemCount; i += 2) {
         const int headDim = i % headSize;
         const float freq = 1.0f / powf(10000.0f, headDim / static_cast<float>(headSize));
         const float val = position * freq;
-        cosHost[pairIdx] = cosf(val);
-        sinHost[pairIdx] = sinf(val);
+        cosHost[i] = cosf(val);
+        sinHost[i] = sinf(val);
+        if (i + 1 < elemCount) {
+            cosHost[i + 1] = cosHost[i];
+            sinHost[i + 1] = sinHost[i];
+        }
     }
 
-    const size_t bytes = pairCount * sizeof(float);
+    const size_t bytes = elemCount * sizeof(float);
     ACL_CHECK(aclrtMalloc(&entry.cosAddr, bytes, ACL_MEM_MALLOC_HUGE_FIRST));
     ACL_CHECK(aclrtMalloc(&entry.sinAddr, bytes, ACL_MEM_MALLOC_HUGE_FIRST));
     ACL_CHECK(aclrtMemcpy(entry.cosAddr, bytes, cosHost.data(), bytes, ACL_MEMCPY_HOST_TO_DEVICE));
@@ -243,68 +240,35 @@ static CNPUBackend::Impl::RopeCacheEntry& GetRopeCacheEntry(CNPUBackend::Impl* i
 }
 
 static void ApplyRopeVector(float* vec,
-                            int pairCount,
+                            int elemCount,
+                            int headSize,
                             void* cosAddr,
                             void* sinAddr,
                             aclrtStream stream) {
-    if (pairCount <= 0) {
+    if (elemCount <= 0 || headSize <= 0) {
         return;
     }
 
-    int64_t pairShape[1] = {pairCount};
-    int64_t stride2[1] = {2};
-    int64_t evenStorageShape[1] = {2 * pairCount};
-    int64_t oddStorageShape[1] = {2 * pairCount - 1};
+    const int heads = elemCount / headSize;
+    int64_t xShape[4] = {1, heads, 1, headSize};
+    int64_t freqShape[4] = {1, 1, 1, headSize};
+    aclTensor* xTensor = CreateTensorFromDevice(vec, xShape, 4, ACL_FLOAT);
+    aclTensor* cosTensor = CreateTensorFromDevice(cosAddr, freqShape, 4, ACL_FLOAT);
+    aclTensor* sinTensor = CreateTensorFromDevice(sinAddr, freqShape, 4, ACL_FLOAT);
 
-    aclTensor* evenTensor = CreateTensorFromDeviceWithStrides(vec, pairShape, stride2,
-                                                              evenStorageShape, 1, ACL_FLOAT);
-    aclTensor* oddTensor = CreateTensorFromDeviceWithStrides(vec + 1, pairShape, stride2,
-                                                             oddStorageShape, 1, ACL_FLOAT);
-    aclTensor* cosTensor = CreateTensorFromDevice(cosAddr, pairShape, 1, ACL_FLOAT);
-    aclTensor* sinTensor = CreateTensorFromDevice(sinAddr, pairShape, 1, ACL_FLOAT);
+    void* outAddr = nullptr;
+    const size_t bytes = elemCount * sizeof(float);
+    ACL_CHECK(aclrtMalloc(&outAddr, bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+    aclTensor* outTensor = CreateTensorFromDevice(outAddr, xShape, 4, ACL_FLOAT);
 
-    void* evenCosAddr = nullptr;
-    void* oddSinAddr = nullptr;
-    void* evenSinAddr = nullptr;
-    void* oddCosAddr = nullptr;
-    const size_t bytes = pairCount * sizeof(float);
-    ACL_CHECK(aclrtMalloc(&evenCosAddr, bytes, ACL_MEM_MALLOC_HUGE_FIRST));
-    ACL_CHECK(aclrtMalloc(&oddSinAddr, bytes, ACL_MEM_MALLOC_HUGE_FIRST));
-    ACL_CHECK(aclrtMalloc(&evenSinAddr, bytes, ACL_MEM_MALLOC_HUGE_FIRST));
-    ACL_CHECK(aclrtMalloc(&oddCosAddr, bytes, ACL_MEM_MALLOC_HUGE_FIRST));
+    RunAclnnRotaryPositionEmbedding(xTensor, cosTensor, sinTensor, outTensor, stream);
+    ACL_CHECK(aclrtMemcpy(vec, bytes, outAddr, bytes, ACL_MEMCPY_DEVICE_TO_DEVICE));
 
-    aclTensor* evenCosTensor = CreateTensorFromDevice(evenCosAddr, pairShape, 1, ACL_FLOAT);
-    aclTensor* oddSinTensor = CreateTensorFromDevice(oddSinAddr, pairShape, 1, ACL_FLOAT);
-    aclTensor* evenSinTensor = CreateTensorFromDevice(evenSinAddr, pairShape, 1, ACL_FLOAT);
-    aclTensor* oddCosTensor = CreateTensorFromDevice(oddCosAddr, pairShape, 1, ACL_FLOAT);
-
-    RunAclnnMulTensor(evenTensor, cosTensor, evenCosTensor, stream);
-    RunAclnnMulTensor(oddTensor, sinTensor, oddSinTensor, stream);
-    RunAclnnMulTensor(evenTensor, sinTensor, evenSinTensor, stream);
-    RunAclnnMulTensor(oddTensor, cosTensor, oddCosTensor, stream);
-
-    const float minusOneValue = -1.0f;
-    const float plusOneValue = 1.0f;
-    aclScalar* minusOne = aclCreateScalar(&minusOneValue, ACL_FLOAT);
-    aclScalar* plusOne = aclCreateScalar(&plusOneValue, ACL_FLOAT);
-
-    RunAclnnAddTensor(evenCosTensor, oddSinTensor, minusOne, evenTensor, stream);
-    RunAclnnAddTensor(evenSinTensor, oddCosTensor, plusOne, oddTensor, stream);
-
-    aclDestroyScalar(minusOne);
-    aclDestroyScalar(plusOne);
-    aclDestroyTensor(evenTensor);
-    aclDestroyTensor(oddTensor);
+    aclDestroyTensor(xTensor);
     aclDestroyTensor(cosTensor);
     aclDestroyTensor(sinTensor);
-    aclDestroyTensor(evenCosTensor);
-    aclDestroyTensor(oddSinTensor);
-    aclDestroyTensor(evenSinTensor);
-    aclDestroyTensor(oddCosTensor);
-    ACL_CHECK(aclrtFree(evenCosAddr));
-    ACL_CHECK(aclrtFree(oddSinAddr));
-    ACL_CHECK(aclrtFree(evenSinAddr));
-    ACL_CHECK(aclrtFree(oddCosAddr));
+    aclDestroyTensor(outTensor);
+    ACL_CHECK(aclrtFree(outAddr));
 }
 
 //若 executor 已存在就复用 ----
@@ -394,12 +358,10 @@ void CNPUBackend::ropeEncoding(float *q, float *k, int headSize, int position, i
 {
     ACL_CHECK(aclrtSetCurrentContext(pImpl->context_));
 
-    const int qPairs = dim / 2;
-    const int kPairs = kvDim / 2;
-    auto& cache = GetRopeCacheEntry(pImpl, headSize, position, qPairs);
+    auto& cache = GetRopeCacheEntry(pImpl, headSize, position, headSize);
 
-    ApplyRopeVector(q, qPairs, cache.cosAddr, cache.sinAddr, pImpl->stream_);
-    ApplyRopeVector(k, kPairs, cache.cosAddr, cache.sinAddr, pImpl->stream_);
+    ApplyRopeVector(q, dim, headSize, cache.cosAddr, cache.sinAddr, pImpl->stream_);
+    ApplyRopeVector(k, kvDim, headSize, cache.cosAddr, cache.sinAddr, pImpl->stream_);
 
     ACL_CHECK(aclrtSynchronizeStream(pImpl->stream_));
 }
