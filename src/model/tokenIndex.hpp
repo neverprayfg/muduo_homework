@@ -3,15 +3,9 @@
 
 
 #include "../common.hpp"
-class CTokenIndex
-{
-public:
+struct CTokenIndex {
     const char* token;
-    int id;     
-
-    CTokenIndex();  
-    CTokenIndex(const char* initToken); 
-    ~CTokenIndex();
+    int id;
 };
 
 #endif

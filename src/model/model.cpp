@@ -9,7 +9,7 @@ int compareTokens(const void *a, const void *b) {
 }
 
 int getTokenIndex(const char* str, CTokenIndex* vocabSortedList, int vocabSize) {
-    CTokenIndex tok{ str };
+    CTokenIndex tok{str, 0};
     CTokenIndex* res = static_cast<CTokenIndex*>(bsearch(&tok, vocabSortedList, vocabSize, sizeof(CTokenIndex), compareTokens));
     return res != nullptr ? res->id : -1;
 }
