@@ -1,5 +1,7 @@
 #include "modelForwardOpt.hpp"
 #ifdef USE_NPU
+#include "../backend/npuBackend.hpp"
+
 float* CModelForwardOpt::forward(int token, int pos) {
     
     CModelConfig* config = &this->config;
@@ -15,9 +17,12 @@ float* CModelForwardOpt::forward(int token, int pos) {
                     embeddingDim * sizeof(float),
                     true,  // dstOnDevice
                     true  // srcOnDevice
-                    );
+    );
+    CNPUBackend* npuBackend = static_cast<CNPUBackend*>(backend);
+    backend->rmsnorm(state->branchActivation, inputVec, w.rmsAttWeight, embeddingDim);
+    float* logitsInput = inputVec;
+
     for (uint64_t layer = 0; layer < config->numLayers; ++layer) {
-        backend->rmsnorm(state->branchActivation, inputVec, w.rmsAttWeight + layer * embeddingDim, embeddingDim);
         const int kvCacheOffset = layer * config->maxSeqLen * kvDim;
         state->k = state->keyCache + kvCacheOffset + pos * kvDim;
         state->v = state->valueCache + kvCacheOffset + pos * kvDim;
@@ -73,19 +78,31 @@ float* CModelForwardOpt::forward(int token, int pos) {
         }
 
         backend->matmul(state->extraBuffer, state->branchActivation, w.wo + layer * embeddingDim * embeddingDim, embeddingDim, embeddingDim);
-        backend->axpy(inputVec, state->extraBuffer, 1.f, embeddingDim);
-        backend->rmsnorm(state->branchActivation, inputVec, w.rmsFfnWeight + layer * embeddingDim, embeddingDim);
+        npuBackend->addRmsNorm(state->branchActivation, inputVec,
+                               inputVec, state->extraBuffer,
+                               w.rmsFfnWeight + layer * embeddingDim,
+                               embeddingDim);
 
         backend->matmul(state->hiddenBuffer, state->branchActivation, w.w1 + layer * embeddingDim * ffnHiddenDim, embeddingDim, ffnHiddenDim);
         backend->matmul(state->extraHiddenBuffer, state->branchActivation, w.w3 + layer * embeddingDim * ffnHiddenDim, embeddingDim, ffnHiddenDim);
 
         backend->swiGLLUFunc(state->hiddenBuffer, state->extraHiddenBuffer, ffnHiddenDim);
-        backend->matmul(state->branchActivation, state->hiddenBuffer, w.w2 + layer * ffnHiddenDim * embeddingDim, ffnHiddenDim, embeddingDim);
-        backend->axpy(inputVec, state->branchActivation, 1.f, embeddingDim);
+        backend->matmul(state->extraBuffer, state->hiddenBuffer, w.w2 + layer * ffnHiddenDim * embeddingDim, ffnHiddenDim, embeddingDim);
+        if (layer + 1 < config->numLayers) {
+            npuBackend->addRmsNorm(state->branchActivation, inputVec,
+                                   inputVec, state->extraBuffer,
+                                   w.rmsAttWeight + (layer + 1) * embeddingDim,
+                                   embeddingDim);
+        } else {
+            npuBackend->addRmsNorm(state->branchActivation, inputVec,
+                                   inputVec, state->extraBuffer,
+                                   w.rmsFinalWeight,
+                                   embeddingDim);
+            logitsInput = state->branchActivation;
+        }
     }
 
-    backend->rmsnorm(inputVec, inputVec, w.rmsFinalWeight, embeddingDim);
-    backend->matmul(state->logits_gpu, inputVec, w.wcls, embeddingDim, config->vocabSize);
+    backend->matmul(state->logits_gpu, logitsInput, w.wcls, embeddingDim, config->vocabSize);
     backend->copyMemory(state->logits, state->logits_gpu,
                         config->vocabSize * sizeof(float),
                         false, // dstOnDevice = Host

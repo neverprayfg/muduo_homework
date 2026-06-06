@@ -7,6 +7,9 @@
 #include "acl/acl.h"
 #include "npuBackend.hpp"
 #include "aclnnop/aclnn_add.h"
+#include "aclnnop/aclnn_add_rms_norm.h"
+#include "aclnnop/aclnn_cast.h"
+#include "aclnnop/aclnn_incre_flash_attention.h"
 #include "aclnnop/aclnn_mul.h"
 #include "aclnnop/aclnn_matmul.h"
 #include "aclnnop/aclnn_sigmoid.h"
@@ -258,6 +261,17 @@ static void RunAclnnSoftmaxTensor(aclTensor* input,
     RunAclnnTwoStage(impl, workspaceSize, executor, stream, aclnnSoftmax);
 }
 
+static void RunAclnnCastTensor(aclTensor* input,
+                               aclDataType dtype,
+                               aclTensor* out,
+                               CNPUBackend::Impl* impl,
+                               aclrtStream stream) {
+    uint64_t workspaceSize = 0;
+    aclOpExecutor* executor = nullptr;
+    ACL_CHECK(aclnnCastGetWorkspaceSize(input, dtype, out, &workspaceSize, &executor));
+    RunAclnnTwoStage(impl, workspaceSize, executor, stream, aclnnCast);
+}
+
 static void RunAclnnRotaryPositionEmbedding(aclTensor* x,
                                             aclTensor* cos,
                                             aclTensor* sin,
@@ -381,6 +395,38 @@ void CNPUBackend::rmsnorm(float *y, float *x, float *w, int n) {
     aclDestroyTensor(rstdTensor);
 }
 
+void CNPUBackend::addRmsNorm(float* y, float* xOut, float* x1, float* x2, float* w, int n) {
+    ACL_CHECK(aclrtSetCurrentContext(pImpl->context_));
+
+    int64_t xShape[2] = {1, n};
+    int64_t wShape[1] = {n};
+    int64_t rstdShape[1] = {1};
+
+    aclTensor* x1Tensor = CreateTensorFromDevice(x1, xShape, 2, ACL_FLOAT);
+    aclTensor* x2Tensor = CreateTensorFromDevice(x2, xShape, 2, ACL_FLOAT);
+    aclTensor* wTensor = CreateTensorFromDevice(w, wShape, 1, ACL_FLOAT);
+    aclTensor* yTensor = CreateTensorFromDevice(y, xShape, 2, ACL_FLOAT);
+    aclTensor* xOutTensor = CreateTensorFromDevice(xOut, xShape, 2, ACL_FLOAT);
+
+    void* rstdAddr = GetTempBuffer(pImpl, 0, sizeof(float));
+    aclTensor* rstdTensor = CreateTensorFromDevice(rstdAddr, rstdShape, 1, ACL_FLOAT);
+
+    uint64_t workspaceSize = 0;
+    aclOpExecutor* executor = nullptr;
+    constexpr double epsilon = 1e-5;
+    ACL_CHECK(aclnnAddRmsNormGetWorkspaceSize(x1Tensor, x2Tensor, wTensor, epsilon,
+                                              yTensor, rstdTensor, xOutTensor,
+                                              &workspaceSize, &executor));
+    RunAclnnTwoStage(pImpl, workspaceSize, executor, pImpl->stream_, aclnnAddRmsNorm);
+
+    aclDestroyTensor(x1Tensor);
+    aclDestroyTensor(x2Tensor);
+    aclDestroyTensor(wTensor);
+    aclDestroyTensor(yTensor);
+    aclDestroyTensor(xOutTensor);
+    aclDestroyTensor(rstdTensor);
+}
+
 /*  TODO
     matmul: 矩阵-向量乘
         o[d][1] = w[d][n] X x[n][1]
@@ -498,43 +544,65 @@ void CNPUBackend::swiGLLUFunc(float* headOutput, float* value, int hiddenDim) {
 
 void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, float* attnScores, float* out, int pos, int headSize) {
     ACL_CHECK(aclrtSetCurrentContext(pImpl->context_));
+    (void)attnScores;
 
     const int seqLen = pos + 1;
-    int64_t qShape[2] = {1, headSize};
-    int64_t scoreShape[2] = {1, seqLen};
-    int64_t kViewShape[2] = {headSize, seqLen};
-    int64_t kStrides[2] = {1, headSize};
-    int64_t kStorageShape[2] = {seqLen, headSize};
-    int64_t vShape[2] = {seqLen, headSize};
-    int64_t outShape[2] = {1, headSize};
+    constexpr size_t float16Bytes = 2;
+    int64_t qShape[4] = {1, 1, 1, headSize};
+    int64_t kvShape[4] = {1, 1, seqLen, headSize};
+    int64_t outShape[4] = {1, 1, 1, headSize};
 
-    void* rawScoreAddr = GetTempBuffer(pImpl, 4, seqLen * sizeof(float));
-    void* scaledScoreAddr = GetTempBuffer(pImpl, 5, seqLen * sizeof(float));
-    void* scaleAddr = GetAttentionScale(pImpl, seqLen, headSize);
+    aclTensor* qTensor = CreateTensorFromDevice(q, qShape, 4, ACL_FLOAT);
+    aclTensor* kTensor = CreateTensorFromDevice(kCache, kvShape, 4, ACL_FLOAT);
+    aclTensor* vTensor = CreateTensorFromDevice(vCache, kvShape, 4, ACL_FLOAT);
+    aclTensor* outTensor = CreateTensorFromDevice(out, outShape, 4, ACL_FLOAT);
 
-    aclTensor* qTensor = CreateTensorFromDevice(q, qShape, 2, ACL_FLOAT);
-    aclTensor* kTensor = CreateTensorFromDeviceWithStrides(kCache, kViewShape, kStrides,
-                                                           kStorageShape, 2, ACL_FLOAT);
-    aclTensor* rawScoreTensor = CreateTensorFromDevice(rawScoreAddr, scoreShape, 2, ACL_FLOAT);
-    aclTensor* scaledScoreTensor = CreateTensorFromDevice(scaledScoreAddr, scoreShape, 2, ACL_FLOAT);
-    aclTensor* scaleTensor = CreateTensorFromDevice(scaleAddr, scoreShape, 2, ACL_FLOAT);
-    aclTensor* scoreTensor = CreateTensorFromDevice(attnScores, scoreShape, 2, ACL_FLOAT);
-    aclTensor* vTensor = CreateTensorFromDevice(vCache, vShape, 2, ACL_FLOAT);
-    aclTensor* outTensor = CreateTensorFromDevice(out, outShape, 2, ACL_FLOAT);
+    void* qHalfAddr = GetTempBuffer(pImpl, 4, headSize * float16Bytes);
+    void* kHalfAddr = GetTempBuffer(pImpl, 5, seqLen * headSize * float16Bytes);
+    void* vHalfAddr = GetTempBuffer(pImpl, 6, seqLen * headSize * float16Bytes);
+    void* outHalfAddr = GetTempBuffer(pImpl, 7, headSize * float16Bytes);
 
-    RunAclnnMatmulTensor(qTensor, kTensor, rawScoreTensor, pImpl, pImpl->stream_);
-    RunAclnnMulTensor(rawScoreTensor, scaleTensor, scaledScoreTensor, pImpl, pImpl->stream_);
-    RunAclnnSoftmaxTensor(scaledScoreTensor, 1, scoreTensor, pImpl, pImpl->stream_);
-    RunAclnnMatmulTensor(scoreTensor, vTensor, outTensor, pImpl, pImpl->stream_);
+    aclTensor* qHalfTensor = CreateTensorFromDevice(qHalfAddr, qShape, 4, ACL_FLOAT16);
+    aclTensor* kHalfTensor = CreateTensorFromDevice(kHalfAddr, kvShape, 4, ACL_FLOAT16);
+    aclTensor* vHalfTensor = CreateTensorFromDevice(vHalfAddr, kvShape, 4, ACL_FLOAT16);
+    aclTensor* outHalfTensor = CreateTensorFromDevice(outHalfAddr, outShape, 4, ACL_FLOAT16);
 
+    RunAclnnCastTensor(qTensor, ACL_FLOAT16, qHalfTensor, pImpl, pImpl->stream_);
+    RunAclnnCastTensor(kTensor, ACL_FLOAT16, kHalfTensor, pImpl, pImpl->stream_);
+    RunAclnnCastTensor(vTensor, ACL_FLOAT16, vHalfTensor, pImpl, pImpl->stream_);
+
+    aclTensor* keyTensors[1] = {kHalfTensor};
+    aclTensor* valueTensors[1] = {vHalfTensor};
+    aclTensorList* keyTensorList = aclCreateTensorList(keyTensors, 1);
+    aclTensorList* valueTensorList = aclCreateTensorList(valueTensors, 1);
+    int64_t actualSeqLen = seqLen;
+    aclIntArray* actualSeqLengths = aclCreateIntArray(&actualSeqLen, 1);
+
+    uint64_t workspaceSize = 0;
+    aclOpExecutor* executor = nullptr;
+    constexpr int64_t numHeads = 1;
+    constexpr int64_t numKeyValueHeads = 1;
+    const double scaleValue = 1.0 / std::sqrt(static_cast<double>(headSize));
+    char inputLayout[] = "BNSD";
+    ACL_CHECK(aclnnIncreFlashAttentionGetWorkspaceSize(qHalfTensor, keyTensorList, valueTensorList,
+                                                       nullptr, nullptr, actualSeqLengths,
+                                                       numHeads, scaleValue, inputLayout,
+                                                       numKeyValueHeads, outHalfTensor,
+                                                       &workspaceSize, &executor));
+    RunAclnnTwoStage(pImpl, workspaceSize, executor, pImpl->stream_, aclnnIncreFlashAttention);
+    RunAclnnCastTensor(outHalfTensor, ACL_FLOAT, outTensor, pImpl, pImpl->stream_);
+
+    aclDestroyTensorList(keyTensorList);
+    aclDestroyTensorList(valueTensorList);
+    aclDestroyIntArray(actualSeqLengths);
     aclDestroyTensor(qTensor);
     aclDestroyTensor(kTensor);
-    aclDestroyTensor(rawScoreTensor);
-    aclDestroyTensor(scaledScoreTensor);
-    aclDestroyTensor(scaleTensor);
-    aclDestroyTensor(scoreTensor);
     aclDestroyTensor(vTensor);
     aclDestroyTensor(outTensor);
+    aclDestroyTensor(qHalfTensor);
+    aclDestroyTensor(kHalfTensor);
+    aclDestroyTensor(vHalfTensor);
+    aclDestroyTensor(outHalfTensor);
 }
 
 void* CNPUBackend::allocMemory(size_t size) {

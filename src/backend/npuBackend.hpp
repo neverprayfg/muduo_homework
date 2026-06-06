@@ -21,6 +21,7 @@ public:
 
     void matmul(float* xout, float* x, float* w, int n, int d);                                                     //NPU
     void rmsnorm(float* o, float* x, float* weight, int size);                                                      //NPU
+    void addRmsNorm(float* y, float* xOut, float* x1, float* x2, float* weight, int size);                          //NPU
     void axpy(float *y, float *x, float factor, int dim);                                                           //NPU
     void swiGLLUFunc(float *hb, float *hb2, int hiddenDim);                                                         //NPU
     //void gemvQkSeq(float *q, float *key, float *att, int pos, int kvDim, int headSize) override;
