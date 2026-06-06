@@ -3,7 +3,6 @@
 #include "../backend/npuBackend.hpp"
 
 float* CModelForwardOpt::forward(int token, int pos) {
-    std::cerr << "[TRACE] forward begin pos=" << pos << " token=" << token << "\n";
     
     CModelConfig* config = &this->config;
     float* inputVec = state->currentActivation;
@@ -19,24 +18,17 @@ float* CModelForwardOpt::forward(int token, int pos) {
                     true,  // dstOnDevice
                     true  // srcOnDevice
     );
-    std::cerr << "[TRACE] token embedding copied\n";
     CNPUBackend* npuBackend = static_cast<CNPUBackend*>(backend);
     backend->rmsnorm(state->branchActivation, inputVec, w.rmsAttWeight, embeddingDim);
-    std::cerr << "[TRACE] first rmsnorm done\n";
     float* logitsInput = inputVec;
 
     for (uint64_t layer = 0; layer < config->numLayers; ++layer) {
-        std::cerr << "[TRACE] layer " << layer << " begin\n";
         const int kvCacheOffset = layer * config->maxSeqLen * kvDim;
 
         backend->matmul(state->q, state->branchActivation, w.wq + layer * embeddingDim * embeddingDim, embeddingDim, embeddingDim);
-        std::cerr << "[TRACE] layer " << layer << " wq done\n";
         backend->matmul(state->k, state->branchActivation, w.wk + layer * embeddingDim * kvDim, embeddingDim, kvDim);
-        std::cerr << "[TRACE] layer " << layer << " wk done\n";
         backend->matmul(state->v, state->branchActivation, w.wv + layer * embeddingDim * kvDim, embeddingDim, kvDim);
-        std::cerr << "[TRACE] layer " << layer << " wv done\n";
         backend->ropeEncoding(state->q, state->k, headSize, pos, embeddingDim, kvDim);
-        std::cerr << "[TRACE] layer " << layer << " rope done\n";
 
         int kvHeadDim = kvDim / config->numKvHeads;
         for (int kvHeadIdx = 0; kvHeadIdx < config->numKvHeads; ++kvHeadIdx) {
@@ -81,50 +73,39 @@ float* CModelForwardOpt::forward(int token, int pos) {
             float* scores = state->attentionScores + headIdx * config->maxSeqLen;
 
             backend->attentionSingleHead(query, k, v, scores, out, pos, headSize);
-            std::cerr << "[TRACE] layer " << layer << " head " << headIdx << " attention done\n";
         }
 
         backend->matmul(state->extraBuffer, state->branchActivation, w.wo + layer * embeddingDim * embeddingDim, embeddingDim, embeddingDim);
-        std::cerr << "[TRACE] layer " << layer << " wo done\n";
         npuBackend->addRmsNorm(state->branchActivation, inputVec,
                                inputVec, state->extraBuffer,
                                w.rmsFfnWeight + layer * embeddingDim,
                                embeddingDim);
-        std::cerr << "[TRACE] layer " << layer << " att addRmsNorm done\n";
 
         backend->matmul(state->hiddenBuffer, state->branchActivation, w.w1 + layer * embeddingDim * ffnHiddenDim, embeddingDim, ffnHiddenDim);
-        std::cerr << "[TRACE] layer " << layer << " w1 done\n";
         backend->matmul(state->extraHiddenBuffer, state->branchActivation, w.w3 + layer * embeddingDim * ffnHiddenDim, embeddingDim, ffnHiddenDim);
-        std::cerr << "[TRACE] layer " << layer << " w3 done\n";
 
         backend->swiGLLUFunc(state->hiddenBuffer, state->extraHiddenBuffer, ffnHiddenDim);
-        std::cerr << "[TRACE] layer " << layer << " swiglu done\n";
         backend->matmul(state->extraBuffer, state->hiddenBuffer, w.w2 + layer * ffnHiddenDim * embeddingDim, ffnHiddenDim, embeddingDim);
-        std::cerr << "[TRACE] layer " << layer << " w2 done\n";
         if (layer + 1 < config->numLayers) {
             npuBackend->addRmsNorm(state->branchActivation, inputVec,
                                    inputVec, state->extraBuffer,
                                    w.rmsAttWeight + (layer + 1) * embeddingDim,
                                    embeddingDim);
-            std::cerr << "[TRACE] layer " << layer << " ffn addRmsNorm done\n";
         } else {
             npuBackend->addRmsNorm(state->branchActivation, inputVec,
                                    inputVec, state->extraBuffer,
                                    w.rmsFinalWeight,
                                    embeddingDim);
             logitsInput = state->branchActivation;
-            std::cerr << "[TRACE] final addRmsNorm done\n";
         }
     }
 
     backend->matmul(state->logits_gpu, logitsInput, w.wcls, embeddingDim, config->vocabSize);
-    std::cerr << "[TRACE] logits matmul done\n";
     backend->copyMemory(state->logits, state->logits_gpu,
                         config->vocabSize * sizeof(float),
                         false, // dstOnDevice = Host
                         true   // srcOnDevice = Device
     );
-    std::cerr << "[TRACE] forward end\n";
     return state->logits;
 }
 #else

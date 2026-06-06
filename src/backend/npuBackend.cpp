@@ -608,8 +608,6 @@ void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, fl
     aclDestroyTensor(vTensor);
     aclDestroyTensor(outTensor);
     aclDestroyTensor(qHalfTensor);
-    aclDestroyTensor(kHalfTensor);
-    aclDestroyTensor(vHalfTensor);
     aclDestroyTensor(outHalfTensor);
 }
 
