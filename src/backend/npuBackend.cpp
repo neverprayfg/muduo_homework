@@ -101,6 +101,37 @@ static aclTensor* CreateTensorFromDevice(void* addr,
                            addr);
 }
 
+static aclTensor* CreateTensorFromDeviceWithStrides(void* addr,
+                                                    const int64_t* viewShape,
+                                                    const int64_t* strides,
+                                                    const int64_t* storageShape,
+                                                    int dim,
+                                                    aclDataType dt) {
+    return aclCreateTensor(viewShape, dim,
+                           dt, strides, 0,
+                           ACL_FORMAT_ND,
+                           storageShape, dim,
+                           addr);
+}
+
+template <typename RunFunc>
+static void RunAclnnTwoStage(uint64_t workspaceSize,
+                             aclOpExecutor* executor,
+                             aclrtStream stream,
+                             RunFunc runFunc) {
+    void* workspaceAddr = nullptr;
+    if (workspaceSize > 0) {
+        ACL_CHECK(aclrtMalloc(&workspaceAddr, workspaceSize, ACL_MEM_MALLOC_HUGE_FIRST));
+    }
+
+    ACL_CHECK(runFunc(workspaceAddr, workspaceSize, executor, stream));
+    ACL_CHECK(aclrtSynchronizeStream(stream));
+
+    if (workspaceAddr != nullptr) {
+        ACL_CHECK(aclrtFree(workspaceAddr));
+    }
+}
+
 //若 executor 已存在就复用 ----
 struct Op2Stage {
     aclOpExecutor* exe{nullptr};
@@ -123,7 +154,32 @@ rmsnorm:归一化
 
 */
 void CNPUBackend::rmsnorm(float *y, float *x, float *w, int n) {
-    // TODO ...
+    ACL_CHECK(aclrtSetCurrentContext(pImpl->context_));
+
+    int64_t xShape[2] = {1, n};
+    int64_t wShape[1] = {n};
+    int64_t rstdShape[1] = {1};
+
+    aclTensor* xTensor = CreateTensorFromDevice(x, xShape, 2, ACL_FLOAT);
+    aclTensor* wTensor = CreateTensorFromDevice(w, wShape, 1, ACL_FLOAT);
+    aclTensor* yTensor = CreateTensorFromDevice(y, xShape, 2, ACL_FLOAT);
+
+    void* rstdAddr = nullptr;
+    ACL_CHECK(aclrtMalloc(&rstdAddr, sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST));
+    aclTensor* rstdTensor = CreateTensorFromDevice(rstdAddr, rstdShape, 1, ACL_FLOAT);
+
+    uint64_t workspaceSize = 0;
+    aclOpExecutor* executor = nullptr;
+    constexpr double epsilon = 1e-5;
+    ACL_CHECK(aclnnRmsNormGetWorkspaceSize(xTensor, wTensor, epsilon, yTensor, rstdTensor,
+                                           &workspaceSize, &executor));
+    RunAclnnTwoStage(workspaceSize, executor, pImpl->stream_, aclnnRmsNorm);
+
+    aclDestroyTensor(xTensor);
+    aclDestroyTensor(wTensor);
+    aclDestroyTensor(yTensor);
+    aclDestroyTensor(rstdTensor);
+    ACL_CHECK(aclrtFree(rstdAddr));
 }
 
 /*  TODO
@@ -131,8 +187,29 @@ void CNPUBackend::rmsnorm(float *y, float *x, float *w, int n) {
         o[d][1] = w[d][n] X x[n][1]
 */
 void CNPUBackend::matmul(float *o, float *x, float *w, int n, int d) { 
+    ACL_CHECK(aclrtSetCurrentContext(pImpl->context_));
 
-    // TODO ....
+    int64_t xShape[2] = {1, n};
+    int64_t wViewShape[2] = {n, d};
+    int64_t wStrides[2] = {1, n};
+    int64_t wStorageShape[2] = {d, n};
+    int64_t outShape[2] = {1, d};
+
+    aclTensor* xTensor = CreateTensorFromDevice(x, xShape, 2, ACL_FLOAT);
+    aclTensor* wTensor = CreateTensorFromDeviceWithStrides(w, wViewShape, wStrides,
+                                                           wStorageShape, 2, ACL_FLOAT);
+    aclTensor* outTensor = CreateTensorFromDevice(o, outShape, 2, ACL_FLOAT);
+
+    uint64_t workspaceSize = 0;
+    aclOpExecutor* executor = nullptr;
+    constexpr int8_t cubeMathType = 1;
+    ACL_CHECK(aclnnMatmulGetWorkspaceSize(xTensor, wTensor, outTensor, cubeMathType,
+                                          &workspaceSize, &executor));
+    RunAclnnTwoStage(workspaceSize, executor, pImpl->stream_, aclnnMatmul);
+
+    aclDestroyTensor(xTensor);
+    aclDestroyTensor(wTensor);
+    aclDestroyTensor(outTensor);
 }
 
 
@@ -170,8 +247,22 @@ void CNPUBackend::ropeEncoding(float *q, float *k, int headSize, int position, i
 scale ：y[i] = y[i] + x[i] * factor 注意和cpu侧算子的不同
 */
 void CNPUBackend::axpy(float* y, float* x, float factor, int dim) {
+    ACL_CHECK(aclrtSetCurrentContext(pImpl->context_));
 
-    // TODO ....
+    int64_t shape[1] = {dim};
+    aclTensor* yTensor = CreateTensorFromDevice(y, shape, 1, ACL_FLOAT);
+    aclTensor* xTensor = CreateTensorFromDevice(x, shape, 1, ACL_FLOAT);
+    aclScalar* alpha = aclCreateScalar(&factor, ACL_FLOAT);
+
+    uint64_t workspaceSize = 0;
+    aclOpExecutor* executor = nullptr;
+    ACL_CHECK(aclnnInplaceAddGetWorkspaceSize(yTensor, xTensor, alpha,
+                                              &workspaceSize, &executor));
+    RunAclnnTwoStage(workspaceSize, executor, pImpl->stream_, aclnnInplaceAdd);
+
+    aclDestroyTensor(yTensor);
+    aclDestroyTensor(xTensor);
+    aclDestroyScalar(alpha);
 }
 
 void CNPUBackend::swiGLLUFunc(float* headOutput, float* value, int hiddenDim) {
