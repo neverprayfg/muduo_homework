@@ -24,8 +24,6 @@ float* CModelForwardOpt::forward(int token, int pos) {
 
     for (uint64_t layer = 0; layer < config->numLayers; ++layer) {
         const int kvCacheOffset = layer * config->maxSeqLen * kvDim;
-        state->k = state->keyCache + kvCacheOffset + pos * kvDim;
-        state->v = state->valueCache + kvCacheOffset + pos * kvDim;
 
         backend->matmul(state->q, state->branchActivation, w.wq + layer * embeddingDim * embeddingDim, embeddingDim, embeddingDim);
         backend->matmul(state->k, state->branchActivation, w.wk + layer * embeddingDim * kvDim, embeddingDim, kvDim);

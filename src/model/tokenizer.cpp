@@ -19,7 +19,7 @@ CTokenizer::~CTokenizer()
         delete[] this->vocab;
     }
     delete[] this->vocabScores;
-    delete this->vocabSortedList;
+    free(this->vocabSortedList);
 }
 void CTokenizer::initializeTokenizer(std::string tokenizerPath, int vocabSize) {
     this->vocabSize = vocabSize;
@@ -70,5 +70,5 @@ void CTokenizer::freeTokenizer() {
     }
     delete[] vocab;
     delete[] vocabScores;
-    delete[] vocabSortedList;
+    free(vocabSortedList);
 }

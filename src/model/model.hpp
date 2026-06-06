@@ -33,7 +33,7 @@ public:
         float* wcls;
     } w; // 模型权重信息
     CModel() = default; 
-    ~CModel() ; 
+    virtual ~CModel() ; 
     
     virtual void load(const std::string& checkpointPath, CModelConfig* modelConfig, int* fileDescriptor, float** data, ssize_t* totalFileSize) ; 
     virtual void encode(CTokenizer* t, std::string text, int8_t bos, int8_t eos, int *tokens, int *nTokens);

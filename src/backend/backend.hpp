@@ -28,9 +28,8 @@ class CBackend {
        virtual void setMemory(void* ptr, int value, size_t size, bool onDevice);
        virtual void sync();
        CBackend();
-        ~CBackend() ;
+        virtual ~CBackend() ;
         
     };
 
 #endif
-

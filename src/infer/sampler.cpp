@@ -6,7 +6,7 @@ CSampler::CSampler() {};
 
 CSampler::~CSampler() {
     if (this->candidates != NULL)
-        delete this->candidates;
+        delete[] this->candidates;
 };
 
 int GreedySample(const float* probs, int size) {

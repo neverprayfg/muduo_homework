@@ -400,7 +400,7 @@ void CNPUBackend::addRmsNorm(float* y, float* xOut, float* x1, float* x2, float*
 
     int64_t xShape[2] = {1, n};
     int64_t wShape[1] = {n};
-    int64_t rstdShape[2] = {1, 1};
+    int64_t rstdShape[1] = {1};
 
     aclTensor* x1Tensor = CreateTensorFromDevice(x1, xShape, 2, ACL_FLOAT);
     aclTensor* x2Tensor = CreateTensorFromDevice(x2, xShape, 2, ACL_FLOAT);
@@ -412,7 +412,7 @@ void CNPUBackend::addRmsNorm(float* y, float* xOut, float* x1, float* x2, float*
     aclTensor* xOutTensor = CreateTensorFromDevice(realXOut, xShape, 2, ACL_FLOAT);
 
     void* rstdAddr = GetTempBuffer(pImpl, 0, sizeof(float));
-    aclTensor* rstdTensor = CreateTensorFromDevice(rstdAddr, rstdShape, 2, ACL_FLOAT);
+    aclTensor* rstdTensor = CreateTensorFromDevice(rstdAddr, rstdShape, 1, ACL_FLOAT);
 
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor = nullptr;
@@ -589,7 +589,7 @@ void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, fl
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor = nullptr;
     constexpr int64_t numHeads = 1;
-    constexpr int64_t numKeyValueHeads = 1;
+    constexpr int64_t numKeyValueHeads = 0;
     const double scaleValue = 1.0 / std::sqrt(static_cast<double>(headSize));
     char inputLayout[] = "BNSD";
     ACL_CHECK(aclnnIncreFlashAttentionGetWorkspaceSize(qHalfTensor, keyTensorList, valueTensorList,

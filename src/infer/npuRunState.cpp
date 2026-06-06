@@ -73,6 +73,22 @@ void CNPURunState::allocateMemory(CModelConfig* config) {
     totalMemoryAllocated += dim * sizeof(float);
     std::cout << "[DEBUG] Allocated memory for q: " << dim * sizeof(float) << " bytes" << std::endl;
 
+    ret = aclrtMalloc((void**)&k, kvDim * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST);
+    if (ret != ACL_ERROR_NONE) {
+        std::cerr << "[ERROR:] NPU memory allocation failed for k!" << std::endl;
+        exit(EXIT_FAILURE);
+    }
+    totalMemoryAllocated += kvDim * sizeof(float);
+    std::cout << "[DEBUG] Allocated memory for k: " << kvDim * sizeof(float) << " bytes" << std::endl;
+
+    ret = aclrtMalloc((void**)&v, kvDim * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST);
+    if (ret != ACL_ERROR_NONE) {
+        std::cerr << "[ERROR:] NPU memory allocation failed for v!" << std::endl;
+        exit(EXIT_FAILURE);
+    }
+    totalMemoryAllocated += kvDim * sizeof(float);
+    std::cout << "[DEBUG] Allocated memory for v: " << kvDim * sizeof(float) << " bytes" << std::endl;
+
     ret = aclrtMalloc((void**)&attentionScores, numHeads * seqLen * sizeof(float), ACL_MEM_MALLOC_HUGE_FIRST);
     if (ret != ACL_ERROR_NONE) {
         std::cerr << "[ERROR:] NPU memory allocation failed for attentionScores!" << std::endl;
@@ -114,7 +130,7 @@ void CNPURunState::allocateMemory(CModelConfig* config) {
 
     // 检查内存分配是否成功
     if (!currentActivation || !branchActivation || !extraBuffer || !hiddenBuffer || !extraHiddenBuffer ||
-        !q || !attentionScores || !logits || !keyCache || !valueCache) {
+        !q || !k || !v || !attentionScores || !logits || !keyCache || !valueCache) {
         std::cerr << "[ERROR:] NPU memory allocation failed!" << std::endl;
         exit(EXIT_FAILURE);
     }
@@ -128,6 +144,8 @@ void CNPURunState::deallocateMemory() {
     aclrtFree(hiddenBuffer);
     aclrtFree(extraHiddenBuffer);
     aclrtFree(q);
+    aclrtFree(k);
+    aclrtFree(v);
     aclrtFree(attentionScores);
     aclrtFree(keyCache);
     aclrtFree(valueCache);
@@ -139,6 +157,8 @@ void CNPURunState::deallocateMemory() {
     extraBuffer = nullptr;
     hiddenBuffer = nullptr;
     q = nullptr;
+    k = nullptr;
+    v = nullptr;
     attentionScores = nullptr;
     keyCache = nullptr;
     valueCache = nullptr;

@@ -25,7 +25,7 @@ public:
     float* valueCache;         // VCache (layer, seqLen, dim)
 
     CRunState();
-    ~CRunState();
+    virtual ~CRunState();
 
     virtual void allocateMemory(CModelConfig* config);
     virtual void deallocateMemory();

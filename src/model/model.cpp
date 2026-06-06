@@ -98,7 +98,7 @@ void CModel::encode(CTokenizer* tokenizer, std::string text, int8_t bos, int8_t 
 
     if (eos) tokens[(*numTokens)++] = 2;
 
-    delete []strBuffer;
+    free(strBuffer);
 }
 
 char* CModel::decode(CTokenizer* tokenizer, int previousToken, int token) {
@@ -213,7 +213,7 @@ void CModel::load(const std::string& checkpointPath, CModelConfig* modelConfig, 
             *data + sizeof(CModelConfig) / sizeof(float),
             weights_size,
             /*dstOnDevice=*/true,
-            /*srcOnDevice=*/true
+            /*srcOnDevice=*/false
         );
     }
     else{
@@ -327,7 +327,7 @@ float* CModel::forward(int token, int pos) {
                 state->logits, 
                 state->logits_gpu,
                 config->vocabSize * sizeof(float),
-                /*dstOnDevice=*/true,
+                /*dstOnDevice=*/false,
                 /*srcOnDevice=*/true
             );
     } 
@@ -335,4 +335,3 @@ float* CModel::forward(int token, int pos) {
         backend->matmul(state->logits, inputVec, w.wcls, embeddingDim, config->vocabSize);
     return state->logits;
 }
-
