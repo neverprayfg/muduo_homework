@@ -2,6 +2,7 @@
 #include <vector>
 #include <iostream>
 #include <algorithm>
+#include <cstdint>
 #include <unordered_map>
 #include <aclnnop/aclnn_rms_norm.h>
 #include "acl/acl.h"
@@ -57,10 +58,17 @@ struct CNPUBackend::Impl {
         int elemCount{0};
     };
 
+    struct HalfKvCacheEntry {
+        void* addr{nullptr};
+        size_t bytes{0};
+        int convertedUpTo{-1};
+    };
+
     ReusableBuffer workspace_;
     std::vector<ReusableBuffer> tempBuffers_;
     std::unordered_map<int, ReusableBuffer> attentionScaleCache_;
     std::unordered_map<uint64_t, RopeCacheEntry> ropeCache_;
+    std::unordered_map<uintptr_t, HalfKvCacheEntry> halfKvCache_;
 };
 
 CNPUBackend::CNPUBackend() {
@@ -101,6 +109,13 @@ CNPUBackend::~CNPUBackend() {
         }
     }
     pImpl->ropeCache_.clear();
+
+    for (auto& item : pImpl->halfKvCache_) {
+        if (item.second.addr != nullptr) {
+            ACL_CHECK(aclrtFree(item.second.addr));
+        }
+    }
+    pImpl->halfKvCache_.clear();
 
     if (pImpl->workspace_.addr != nullptr) {
         ACL_CHECK(aclrtFree(pImpl->workspace_.addr));
@@ -281,6 +296,54 @@ static void RunAclnnCastTensor(aclTensor* input,
     ACL_CHECK(aclnnCastGetWorkspaceSize(input, dtype, out, &workspaceSize, &executor));
     RunAclnnTwoStage(impl, workspaceSize, executor, stream, aclnnCast,
                      synchronize, workspaceSlot);
+}
+
+static void* GetHalfKvCacheCurrent(CNPUBackend::Impl* impl,
+                                   float* base,
+                                   int pos,
+                                   int headSize,
+                                   aclrtStream stream,
+                                   size_t castWorkspaceSlot) {
+    constexpr size_t float16Bytes = 2;
+    const uintptr_t key = reinterpret_cast<uintptr_t>(base);
+    auto& entry = impl->halfKvCache_[key];
+
+    const size_t rowBytes = headSize * float16Bytes;
+    const size_t neededBytes = static_cast<size_t>(pos + 1) * rowBytes;
+    if (entry.bytes < neededBytes) {
+        size_t newBytes = entry.bytes == 0 ? rowBytes * 16 : entry.bytes;
+        while (newBytes < neededBytes) {
+            newBytes *= 2;
+        }
+
+        void* newAddr = nullptr;
+        ACL_CHECK(aclrtMalloc(&newAddr, newBytes, ACL_MEM_MALLOC_HUGE_FIRST));
+        if (entry.addr != nullptr && entry.bytes > 0) {
+            ACL_CHECK(aclrtMemcpy(newAddr, newBytes,
+                                  entry.addr, entry.bytes,
+                                  ACL_MEMCPY_DEVICE_TO_DEVICE));
+            ACL_CHECK(aclrtFree(entry.addr));
+        }
+        entry.addr = newAddr;
+        entry.bytes = newBytes;
+    }
+
+    const bool shouldCastCurrentRow = (pos == 0 || entry.convertedUpTo < pos);
+    if (shouldCastCurrentRow) {
+        int64_t rowShape[4] = {1, 1, 1, headSize};
+        float* srcRow = base + static_cast<size_t>(pos) * headSize;
+        void* dstRow = static_cast<char*>(entry.addr) + static_cast<size_t>(pos) * rowBytes;
+
+        aclTensor* srcTensor = CreateTensorFromDevice(srcRow, rowShape, 4, ACL_FLOAT);
+        aclTensor* dstTensor = CreateTensorFromDevice(dstRow, rowShape, 4, ACL_FLOAT16);
+        RunAclnnCastTensor(srcTensor, ACL_FLOAT16, dstTensor, impl, stream,
+                           false, castWorkspaceSlot);
+        aclDestroyTensor(srcTensor);
+        aclDestroyTensor(dstTensor);
+        entry.convertedUpTo = pos;
+    }
+
+    return entry.addr;
 }
 
 static void RunAclnnRotaryPositionEmbedding(aclTensor* x,
@@ -565,14 +628,14 @@ void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, fl
     int64_t outShape[4] = {1, 1, 1, headSize};
 
     aclTensor* qTensor = CreateTensorFromDevice(q, qShape, 4, ACL_FLOAT);
-    aclTensor* kTensor = CreateTensorFromDevice(kCache, kvShape, 4, ACL_FLOAT);
-    aclTensor* vTensor = CreateTensorFromDevice(vCache, kvShape, 4, ACL_FLOAT);
     aclTensor* outTensor = CreateTensorFromDevice(out, outShape, 4, ACL_FLOAT);
 
     void* qHalfAddr = GetTempBuffer(pImpl, 4, headSize * float16Bytes);
-    void* kHalfAddr = GetTempBuffer(pImpl, 5, seqLen * headSize * float16Bytes);
-    void* vHalfAddr = GetTempBuffer(pImpl, 6, seqLen * headSize * float16Bytes);
     void* outHalfAddr = GetTempBuffer(pImpl, 7, headSize * float16Bytes);
+    void* kHalfAddr = GetHalfKvCacheCurrent(pImpl, kCache, pos, headSize,
+                                            pImpl->stream_, 31);
+    void* vHalfAddr = GetHalfKvCacheCurrent(pImpl, vCache, pos, headSize,
+                                            pImpl->stream_, 32);
 
     aclTensor* qHalfTensor = CreateTensorFromDevice(qHalfAddr, qShape, 4, ACL_FLOAT16);
     aclTensor* kHalfTensor = CreateTensorFromDevice(kHalfAddr, kvShape, 4, ACL_FLOAT16);
@@ -581,10 +644,6 @@ void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, fl
 
     RunAclnnCastTensor(qTensor, ACL_FLOAT16, qHalfTensor, pImpl, pImpl->stream_,
                        false, 30);
-    RunAclnnCastTensor(kTensor, ACL_FLOAT16, kHalfTensor, pImpl, pImpl->stream_,
-                       false, 31);
-    RunAclnnCastTensor(vTensor, ACL_FLOAT16, vHalfTensor, pImpl, pImpl->stream_,
-                       false, 32);
 
     aclTensor* keyTensors[1] = {kHalfTensor};
     aclTensor* valueTensors[1] = {vHalfTensor};
@@ -614,8 +673,6 @@ void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, fl
     aclDestroyTensorList(valueTensorList);
     aclDestroyIntArray(actualSeqLengths);
     aclDestroyTensor(qTensor);
-    aclDestroyTensor(kTensor);
-    aclDestroyTensor(vTensor);
     aclDestroyTensor(outTensor);
     aclDestroyTensor(qHalfTensor);
     aclDestroyTensor(outHalfTensor);
