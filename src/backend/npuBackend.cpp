@@ -40,6 +40,8 @@
     printf((message), ##__VA_ARGS__); \
     fflush(stdout);
 
+constexpr size_t kDefaultWorkspaceSlot = static_cast<size_t>(-1);
+
 struct CNPUBackend::Impl {
     aclrtContext context_;
     aclrtStream  stream_;
@@ -219,11 +221,17 @@ static void RunAclnnTwoStage(CNPUBackend::Impl* impl,
                              uint64_t workspaceSize,
                              aclOpExecutor* executor,
                              aclrtStream stream,
-                             RunFunc runFunc) {
-    void* workspaceAddr = GetWorkspace(impl, workspaceSize);
+                             RunFunc runFunc,
+                             bool synchronize = true,
+                             size_t workspaceSlot = kDefaultWorkspaceSlot) {
+    void* workspaceAddr = (workspaceSlot == kDefaultWorkspaceSlot)
+                            ? GetWorkspace(impl, workspaceSize)
+                            : GetTempBuffer(impl, workspaceSlot, workspaceSize);
 
     ACL_CHECK(runFunc(workspaceAddr, workspaceSize, executor, stream));
-    ACL_CHECK(aclrtSynchronizeStream(stream));
+    if (synchronize) {
+        ACL_CHECK(aclrtSynchronizeStream(stream));
+    }
 }
 
 static void RunAclnnMulTensor(aclTensor* lhs,
@@ -265,11 +273,14 @@ static void RunAclnnCastTensor(aclTensor* input,
                                aclDataType dtype,
                                aclTensor* out,
                                CNPUBackend::Impl* impl,
-                               aclrtStream stream) {
+                               aclrtStream stream,
+                               bool synchronize = true,
+                               size_t workspaceSlot = kDefaultWorkspaceSlot) {
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor = nullptr;
     ACL_CHECK(aclnnCastGetWorkspaceSize(input, dtype, out, &workspaceSize, &executor));
-    RunAclnnTwoStage(impl, workspaceSize, executor, stream, aclnnCast);
+    RunAclnnTwoStage(impl, workspaceSize, executor, stream, aclnnCast,
+                     synchronize, workspaceSlot);
 }
 
 static void RunAclnnRotaryPositionEmbedding(aclTensor* x,
@@ -476,8 +487,6 @@ void CNPUBackend::ropeEncoding(float *q, float *k, int headSize, int position, i
 
     ApplyRopeVector(q, dim, headSize, cache.cosAddr, cache.sinAddr, pImpl, pImpl->stream_);
     ApplyRopeVector(k, kvDim, headSize, cache.cosAddr, cache.sinAddr, pImpl, pImpl->stream_);
-
-    ACL_CHECK(aclrtSynchronizeStream(pImpl->stream_));
 }
 
 
@@ -521,25 +530,20 @@ void CNPUBackend::swiGLLUFunc(float* headOutput, float* value, int hiddenDim) {
     uint64_t sigmoidWsSize = 0;
     aclOpExecutor* sigmoidExecutor = nullptr;
     ACL_CHECK(aclnnSigmoidGetWorkspaceSize(headOutputTensor, sigmoidTensor, &sigmoidWsSize, &sigmoidExecutor));
-
-    void* sigmoidWs = GetWorkspace(pImpl, sigmoidWsSize);
-    ACL_CHECK(aclnnSigmoid(sigmoidWs, sigmoidWsSize, sigmoidExecutor, pImpl->stream_));
-    ACL_CHECK(aclrtSynchronizeStream(pImpl->stream_));
+    RunAclnnTwoStage(pImpl, sigmoidWsSize, sigmoidExecutor, pImpl->stream_,
+                     aclnnSigmoid, false, 40);
 
     uint64_t mul1WsSize = 0;
     aclOpExecutor* mul1Executor = nullptr;
     ACL_CHECK(aclnnMulGetWorkspaceSize(headOutputTensor, sigmoidTensor, tmpTensor, &mul1WsSize, &mul1Executor));
-
-    void* mul1Ws = GetWorkspace(pImpl, mul1WsSize);
-    ACL_CHECK(aclnnMul(mul1Ws, mul1WsSize, mul1Executor, pImpl->stream_));
-    ACL_CHECK(aclrtSynchronizeStream(pImpl->stream_));
+    RunAclnnTwoStage(pImpl, mul1WsSize, mul1Executor, pImpl->stream_,
+                     aclnnMul, false, 41);
 
     uint64_t mul2WsSize = 0;
     aclOpExecutor* mul2Executor = nullptr;
     ACL_CHECK(aclnnMulGetWorkspaceSize(tmpTensor, valueTensor, headOutputTensor, &mul2WsSize, &mul2Executor));
-
-    void* mul2Ws = GetWorkspace(pImpl, mul2WsSize);
-    ACL_CHECK(aclnnMul(mul2Ws, mul2WsSize, mul2Executor, pImpl->stream_));
+    RunAclnnTwoStage(pImpl, mul2WsSize, mul2Executor, pImpl->stream_,
+                     aclnnMul, false, 42);
     ACL_CHECK(aclrtSynchronizeStream(pImpl->stream_));
 
     aclDestroyTensor(headOutputTensor);
@@ -575,9 +579,12 @@ void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, fl
     aclTensor* vHalfTensor = CreateTensorFromDevice(vHalfAddr, kvShape, 4, ACL_FLOAT16);
     aclTensor* outHalfTensor = CreateTensorFromDevice(outHalfAddr, outShape, 4, ACL_FLOAT16);
 
-    RunAclnnCastTensor(qTensor, ACL_FLOAT16, qHalfTensor, pImpl, pImpl->stream_);
-    RunAclnnCastTensor(kTensor, ACL_FLOAT16, kHalfTensor, pImpl, pImpl->stream_);
-    RunAclnnCastTensor(vTensor, ACL_FLOAT16, vHalfTensor, pImpl, pImpl->stream_);
+    RunAclnnCastTensor(qTensor, ACL_FLOAT16, qHalfTensor, pImpl, pImpl->stream_,
+                       false, 30);
+    RunAclnnCastTensor(kTensor, ACL_FLOAT16, kHalfTensor, pImpl, pImpl->stream_,
+                       false, 31);
+    RunAclnnCastTensor(vTensor, ACL_FLOAT16, vHalfTensor, pImpl, pImpl->stream_,
+                       false, 32);
 
     aclTensor* keyTensors[1] = {kHalfTensor};
     aclTensor* valueTensors[1] = {vHalfTensor};
@@ -597,8 +604,11 @@ void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, fl
                                                        numHeads, scaleValue, inputLayout,
                                                        numKeyValueHeads, outHalfTensor,
                                                        &workspaceSize, &executor));
-    RunAclnnTwoStage(pImpl, workspaceSize, executor, pImpl->stream_, aclnnIncreFlashAttention);
-    RunAclnnCastTensor(outHalfTensor, ACL_FLOAT, outTensor, pImpl, pImpl->stream_);
+    RunAclnnTwoStage(pImpl, workspaceSize, executor, pImpl->stream_,
+                     aclnnIncreFlashAttention, false, 33);
+    RunAclnnCastTensor(outHalfTensor, ACL_FLOAT, outTensor, pImpl, pImpl->stream_,
+                       false, 34);
+    ACL_CHECK(aclrtSynchronizeStream(pImpl->stream_));
 
     aclDestroyTensorList(keyTensorList);
     aclDestroyTensorList(valueTensorList);
