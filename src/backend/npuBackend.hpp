@@ -26,8 +26,8 @@ public:
     //void gemvQkSeq(float *q, float *key, float *att, int pos, int kvDim, int headSize) override;
     //void softmax(float* x, int size) override;
     //void weightedV(float *xb, float *value, float *att, int pos, int kvDim, int headSize) override;
-    void attentionSingleHead(float* q,float* k,float* v,float* attnScores,float* out,int pos,int headSize);          //三合一：CPU
-    void ropeEncoding(float *q, float *k, int headSize, int position, int dim, int kvDim);                           //CPU
+    void attentionSingleHead(float* q,float* k,float* v,float* attnScores,float* out,int pos,int headSize);          //NPU
+    void ropeEncoding(float *q, float *k, int headSize, int position, int dim, int kvDim);                           //NPU
     void* allocMemory(size_t size);
     void freeMemory(void* ptr);
     void copyMemory(void* dst, const void* src, size_t size,
