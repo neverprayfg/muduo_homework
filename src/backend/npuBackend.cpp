@@ -3,6 +3,7 @@
 #include <iostream>
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <unordered_map>
 #include <aclnnop/aclnn_rms_norm.h>
 #include "acl/acl.h"
@@ -66,7 +67,6 @@ struct CNPUBackend::Impl {
 
     ReusableBuffer workspace_;
     std::vector<ReusableBuffer> tempBuffers_;
-    std::unordered_map<int, ReusableBuffer> attentionScaleCache_;
     std::unordered_map<uint64_t, RopeCacheEntry> ropeCache_;
     std::unordered_map<uintptr_t, HalfKvCacheEntry> halfKvCache_;
 };
@@ -126,13 +126,6 @@ CNPUBackend::~CNPUBackend() {
         }
     }
     pImpl->tempBuffers_.clear();
-    for (auto& item : pImpl->attentionScaleCache_) {
-        if (item.second.addr != nullptr) {
-            ACL_CHECK(aclrtFree(item.second.addr));
-        }
-    }
-    pImpl->attentionScaleCache_.clear();
-
     std::cerr << "[DBG] aclrtDestroyStream\n";
     ACL_CHECK(aclrtDestroyStream(pImpl->stream_));
 
@@ -211,26 +204,6 @@ static void* GetTempBuffer(CNPUBackend::Impl* impl, size_t slot, size_t bytes) {
     return buffer.addr;
 }
 
-static void* GetAttentionScale(CNPUBackend::Impl* impl, int seqLen, int headSize) {
-    const int key = (headSize << 16) ^ seqLen;
-    auto it = impl->attentionScaleCache_.find(key);
-    if (it != impl->attentionScaleCache_.end()) {
-        return it->second.addr;
-    }
-
-    CNPUBackend::Impl::ReusableBuffer buffer;
-    buffer.bytes = seqLen * sizeof(float);
-    const float scaleValue = 1.0f / std::sqrt(static_cast<float>(headSize));
-    std::vector<float> scaleHost(seqLen, scaleValue);
-    ACL_CHECK(aclrtMalloc(&buffer.addr, buffer.bytes, ACL_MEM_MALLOC_HUGE_FIRST));
-    ACL_CHECK(aclrtMemcpy(buffer.addr, buffer.bytes,
-                          scaleHost.data(), buffer.bytes,
-                          ACL_MEMCPY_HOST_TO_DEVICE));
-
-    auto inserted = impl->attentionScaleCache_.emplace(key, buffer);
-    return inserted.first->second.addr;
-}
-
 template <typename RunFunc>
 static void RunAclnnTwoStage(CNPUBackend::Impl* impl,
                              uint64_t workspaceSize,
@@ -253,11 +226,27 @@ static void RunAclnnMulTensor(aclTensor* lhs,
                               aclTensor* rhs,
                               aclTensor* out,
                               CNPUBackend::Impl* impl,
-                              aclrtStream stream) {
+                              aclrtStream stream,
+                              bool synchronize = true,
+                              size_t workspaceSlot = kDefaultWorkspaceSlot) {
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor = nullptr;
     ACL_CHECK(aclnnMulGetWorkspaceSize(lhs, rhs, out, &workspaceSize, &executor));
-    RunAclnnTwoStage(impl, workspaceSize, executor, stream, aclnnMul);
+    RunAclnnTwoStage(impl, workspaceSize, executor, stream, aclnnMul,
+                     synchronize, workspaceSlot);
+}
+
+static void RunAclnnSigmoidTensor(aclTensor* input,
+                                  aclTensor* out,
+                                  CNPUBackend::Impl* impl,
+                                  aclrtStream stream,
+                                  bool synchronize = true,
+                                  size_t workspaceSlot = kDefaultWorkspaceSlot) {
+    uint64_t workspaceSize = 0;
+    aclOpExecutor* executor = nullptr;
+    ACL_CHECK(aclnnSigmoidGetWorkspaceSize(input, out, &workspaceSize, &executor));
+    RunAclnnTwoStage(impl, workspaceSize, executor, stream, aclnnSigmoid,
+                     synchronize, workspaceSlot);
 }
 
 static void RunAclnnMatmulTensor(aclTensor* lhs,
@@ -590,23 +579,12 @@ void CNPUBackend::swiGLLUFunc(float* headOutput, float* value, int hiddenDim) {
     void* tmpOutputAddr = GetTempBuffer(pImpl, 3, hiddenDim * sizeof(float));
     aclTensor* tmpTensor = CreateTensorFromDevice(tmpOutputAddr, shape, 1, ACL_FLOAT);
 
-    uint64_t sigmoidWsSize = 0;
-    aclOpExecutor* sigmoidExecutor = nullptr;
-    ACL_CHECK(aclnnSigmoidGetWorkspaceSize(headOutputTensor, sigmoidTensor, &sigmoidWsSize, &sigmoidExecutor));
-    RunAclnnTwoStage(pImpl, sigmoidWsSize, sigmoidExecutor, pImpl->stream_,
-                     aclnnSigmoid, false, 40);
-
-    uint64_t mul1WsSize = 0;
-    aclOpExecutor* mul1Executor = nullptr;
-    ACL_CHECK(aclnnMulGetWorkspaceSize(headOutputTensor, sigmoidTensor, tmpTensor, &mul1WsSize, &mul1Executor));
-    RunAclnnTwoStage(pImpl, mul1WsSize, mul1Executor, pImpl->stream_,
-                     aclnnMul, false, 41);
-
-    uint64_t mul2WsSize = 0;
-    aclOpExecutor* mul2Executor = nullptr;
-    ACL_CHECK(aclnnMulGetWorkspaceSize(tmpTensor, valueTensor, headOutputTensor, &mul2WsSize, &mul2Executor));
-    RunAclnnTwoStage(pImpl, mul2WsSize, mul2Executor, pImpl->stream_,
-                     aclnnMul, false, 42);
+    RunAclnnSigmoidTensor(headOutputTensor, sigmoidTensor, pImpl, pImpl->stream_,
+                          false, 40);
+    RunAclnnMulTensor(headOutputTensor, sigmoidTensor, tmpTensor, pImpl, pImpl->stream_,
+                      false, 41);
+    RunAclnnMulTensor(tmpTensor, valueTensor, headOutputTensor, pImpl, pImpl->stream_,
+                      false, 42);
     ACL_CHECK(aclrtSynchronizeStream(pImpl->stream_));
 
     aclDestroyTensor(headOutputTensor);
@@ -655,7 +633,7 @@ void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, fl
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor = nullptr;
     constexpr int64_t numHeads = 1;
-    constexpr int64_t numKeyValueHeads = 0;
+    constexpr int64_t numKeyValueHeads = 1;
     const double scaleValue = 1.0 / std::sqrt(static_cast<double>(headSize));
     char inputLayout[] = "BNSD";
     ACL_CHECK(aclnnIncreFlashAttentionGetWorkspaceSize(qHalfTensor, keyTensorList, valueTensorList,
@@ -675,6 +653,8 @@ void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, fl
     aclDestroyTensor(qTensor);
     aclDestroyTensor(outTensor);
     aclDestroyTensor(qHalfTensor);
+    aclDestroyTensor(kHalfTensor);
+    aclDestroyTensor(vHalfTensor);
     aclDestroyTensor(outHalfTensor);
 }
 
