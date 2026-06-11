@@ -55,6 +55,10 @@
 #define ENABLE_ADD_RMS_NORM 1
 #endif
 
+#ifndef ENABLE_INCRE_FLASH_ATTENTION
+#define ENABLE_INCRE_FLASH_ATTENTION 1
+#endif
+
 constexpr size_t kDefaultWorkspaceSlot = static_cast<size_t>(-1);
 
 struct CNPUBackend::Impl {
@@ -338,6 +342,8 @@ static void* GetHalfKvCacheCurrent(CNPUBackend::Impl* impl,
 
         aclTensor* srcTensor = CreateTensorFromDevice(srcRow, rowShape, 4, ACL_FLOAT);
         aclTensor* dstTensor = CreateTensorFromDevice(dstRow, rowShape, 4, ACL_FLOAT16);
+        ACL_CHECK_NOT_NULL(srcTensor);
+        ACL_CHECK_NOT_NULL(dstTensor);
         RunAclnnCastTensor(srcTensor, ACL_FLOAT16, dstTensor, impl, stream,
                            true, castWorkspaceSlot);
         aclDestroyTensor(srcTensor);
@@ -630,7 +636,7 @@ void CNPUBackend::swiGLLUFunc(float* headOutput, float* value, int hiddenDim) {
 void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, float* attnScores, float* out, int pos, int headSize) {
     ACL_CHECK(aclrtSetCurrentContext(pImpl->context_));
 
-#ifdef ENABLE_INCRE_FLASH_ATTENTION
+#if ENABLE_INCRE_FLASH_ATTENTION
     (void)attnScores;
 
     const int seqLen = pos + 1;
@@ -676,7 +682,8 @@ void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, fl
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor = nullptr;
     constexpr int64_t numHeads = 1;
-    constexpr int64_t numKeyValueHeads = 1;
+    // CANN IncreFlashAttention docs require 0 for Atlas inference devices.
+    constexpr int64_t numKeyValueHeads = 0;
     const double scaleValue = 1.0 / std::sqrt(static_cast<double>(headSize));
     char inputLayout[] = "BNSD";
     ACL_CHECK(aclnnIncreFlashAttentionGetWorkspaceSize(qHalfTensor, keyTensorList, valueTensorList,
