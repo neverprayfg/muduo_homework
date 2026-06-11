@@ -86,6 +86,7 @@ struct CNPUBackend::Impl {
     std::vector<ReusableBuffer> tempBuffers_;
     std::unordered_map<uint64_t, RopeCacheEntry> ropeCache_;
     std::unordered_map<uintptr_t, HalfKvCacheEntry> halfKvCache_;
+    std::unordered_map<uintptr_t, HalfKvCacheEntry> halfKvAllCache_;
 };
 
 CNPUBackend::CNPUBackend() {
@@ -133,6 +134,12 @@ CNPUBackend::~CNPUBackend() {
         }
     }
     pImpl->halfKvCache_.clear();
+    for (auto& item : pImpl->halfKvAllCache_) {
+        if (item.second.addr != nullptr) {
+            ACL_CHECK(aclrtFree(item.second.addr));
+        }
+    }
+    pImpl->halfKvAllCache_.clear();
 
     if (pImpl->workspace_.addr != nullptr) {
         ACL_CHECK(aclrtFree(pImpl->workspace_.addr));
@@ -341,6 +348,57 @@ static void* GetHalfKvCacheCurrent(CNPUBackend::Impl* impl,
         void* dstRow = static_cast<char*>(entry.addr) + static_cast<size_t>(pos) * rowBytes;
 
         aclTensor* srcTensor = CreateTensorFromDevice(srcRow, rowShape, 3, ACL_FLOAT);
+        aclTensor* dstTensor = CreateTensorFromDevice(dstRow, rowShape, 3, ACL_FLOAT16);
+        ACL_CHECK_NOT_NULL(srcTensor);
+        ACL_CHECK_NOT_NULL(dstTensor);
+        RunAclnnCastTensor(srcTensor, ACL_FLOAT16, dstTensor, impl, stream,
+                           true, castWorkspaceSlot);
+        aclDestroyTensor(srcTensor);
+        aclDestroyTensor(dstTensor);
+        entry.convertedUpTo = pos;
+    }
+
+    return entry.addr;
+}
+
+static void* GetHalfKvAllHeadsCurrent(CNPUBackend::Impl* impl,
+                                      void* cacheKeyBase,
+                                      float* currentRow,
+                                      int pos,
+                                      int rowElems,
+                                      aclrtStream stream,
+                                      size_t castWorkspaceSlot) {
+    constexpr size_t float16Bytes = 2;
+    const uintptr_t key = reinterpret_cast<uintptr_t>(cacheKeyBase)
+                        ^ (static_cast<uintptr_t>(rowElems) << 32);
+    auto& entry = impl->halfKvAllCache_[key];
+
+    const size_t rowBytes = static_cast<size_t>(rowElems) * float16Bytes;
+    const size_t neededBytes = static_cast<size_t>(pos + 1) * rowBytes;
+    if (entry.bytes < neededBytes) {
+        size_t newBytes = entry.bytes == 0 ? rowBytes * 16 : entry.bytes;
+        while (newBytes < neededBytes) {
+            newBytes *= 2;
+        }
+
+        void* newAddr = nullptr;
+        ACL_CHECK(aclrtMalloc(&newAddr, newBytes, ACL_MEM_MALLOC_HUGE_FIRST));
+        if (entry.addr != nullptr && entry.bytes > 0) {
+            ACL_CHECK(aclrtMemcpy(newAddr, newBytes,
+                                  entry.addr, entry.bytes,
+                                  ACL_MEMCPY_DEVICE_TO_DEVICE));
+            ACL_CHECK(aclrtFree(entry.addr));
+        }
+        entry.addr = newAddr;
+        entry.bytes = newBytes;
+    }
+
+    const bool shouldCastCurrentRow = (pos == 0 || entry.convertedUpTo < pos);
+    if (shouldCastCurrentRow) {
+        int64_t rowShape[3] = {1, 1, rowElems};
+        void* dstRow = static_cast<char*>(entry.addr) + static_cast<size_t>(pos) * rowBytes;
+
+        aclTensor* srcTensor = CreateTensorFromDevice(currentRow, rowShape, 3, ACL_FLOAT);
         aclTensor* dstTensor = CreateTensorFromDevice(dstRow, rowShape, 3, ACL_FLOAT16);
         ACL_CHECK_NOT_NULL(srcTensor);
         ACL_CHECK_NOT_NULL(dstTensor);
@@ -742,6 +800,107 @@ void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, fl
     aclDestroyTensor(scoreTensor);
     aclDestroyTensor(vTensor);
     aclDestroyTensor(outTensor);
+#endif
+}
+
+void CNPUBackend::attentionAllHeads(float* q,
+                                    float* kCurrent,
+                                    float* vCurrent,
+                                    float* kCacheKey,
+                                    float* vCacheKey,
+                                    float* out,
+                                    int pos,
+                                    int numHeads,
+                                    int headSize) {
+    ACL_CHECK(aclrtSetCurrentContext(pImpl->context_));
+
+#if ENABLE_INCRE_FLASH_ATTENTION
+    const int seqLen = pos + 1;
+    const int totalDim = numHeads * headSize;
+    constexpr size_t float16Bytes = 2;
+
+    int64_t qShape[3] = {1, 1, totalDim};
+    int64_t kvShape[3] = {1, seqLen, totalDim};
+    int64_t outShape[3] = {1, 1, totalDim};
+
+    aclTensor* qTensor = CreateTensorFromDevice(q, qShape, 3, ACL_FLOAT);
+    aclTensor* outTensor = CreateTensorFromDevice(out, outShape, 3, ACL_FLOAT);
+
+    void* qHalfAddr = GetTempBuffer(pImpl, 9,
+                                    static_cast<size_t>(totalDim) * float16Bytes);
+    void* outHalfAddr = GetTempBuffer(pImpl, 10,
+                                      static_cast<size_t>(totalDim) * float16Bytes);
+    void* kHalfAddr = GetHalfKvAllHeadsCurrent(pImpl, kCacheKey, kCurrent, pos, totalDim,
+                                               pImpl->stream_, 54);
+    void* vHalfAddr = GetHalfKvAllHeadsCurrent(pImpl, vCacheKey, vCurrent, pos, totalDim,
+                                               pImpl->stream_, 55);
+
+    aclTensor* qHalfTensor = CreateTensorFromDevice(qHalfAddr, qShape, 3, ACL_FLOAT16);
+    aclTensor* kHalfTensor = CreateTensorFromDevice(kHalfAddr, kvShape, 3, ACL_FLOAT16);
+    aclTensor* vHalfTensor = CreateTensorFromDevice(vHalfAddr, kvShape, 3, ACL_FLOAT16);
+    aclTensor* outHalfTensor = CreateTensorFromDevice(outHalfAddr, outShape, 3, ACL_FLOAT16);
+    ACL_CHECK_NOT_NULL(qTensor);
+    ACL_CHECK_NOT_NULL(outTensor);
+    ACL_CHECK_NOT_NULL(qHalfTensor);
+    ACL_CHECK_NOT_NULL(kHalfTensor);
+    ACL_CHECK_NOT_NULL(vHalfTensor);
+    ACL_CHECK_NOT_NULL(outHalfTensor);
+
+    RunAclnnCastTensor(qTensor, ACL_FLOAT16, qHalfTensor, pImpl, pImpl->stream_,
+                       false, 56);
+
+    aclTensor* keyTensors[1] = {kHalfTensor};
+    aclTensor* valueTensors[1] = {vHalfTensor};
+    aclTensorList* keyTensorList = aclCreateTensorList(keyTensors, 1);
+    aclTensorList* valueTensorList = aclCreateTensorList(valueTensors, 1);
+    ACL_CHECK_NOT_NULL(keyTensorList);
+    ACL_CHECK_NOT_NULL(valueTensorList);
+
+    uint64_t workspaceSize = 0;
+    aclOpExecutor* executor = nullptr;
+    const int64_t aclNumHeads = numHeads;
+    // Atlas inference devices require 0 here; GQA/MQA falls back to per-head call site.
+    constexpr int64_t numKeyValueHeads = 0;
+    const double scaleValue = 1.0 / std::sqrt(static_cast<double>(headSize));
+    char inputLayout[] = "BSH";
+    ACL_CHECK(aclnnIncreFlashAttentionGetWorkspaceSize(qHalfTensor,
+                                                       keyTensorList,
+                                                       valueTensorList,
+                                                       nullptr,
+                                                       nullptr,
+                                                       nullptr,
+                                                       aclNumHeads,
+                                                       scaleValue,
+                                                       inputLayout,
+                                                       numKeyValueHeads,
+                                                       outHalfTensor,
+                                                       &workspaceSize,
+                                                       &executor));
+    RunAclnnTwoStage(pImpl, workspaceSize, executor, pImpl->stream_,
+                     aclnnIncreFlashAttention, false, 57);
+    RunAclnnCastTensor(outHalfTensor, ACL_FLOAT, outTensor, pImpl, pImpl->stream_,
+                       false, 58);
+    ACL_CHECK(aclrtSynchronizeStream(pImpl->stream_));
+
+    aclDestroyTensorList(keyTensorList);
+    aclDestroyTensorList(valueTensorList);
+    aclDestroyTensor(qTensor);
+    aclDestroyTensor(outTensor);
+    aclDestroyTensor(qHalfTensor);
+    // aclDestroyTensorList releases the tensor descriptors it contains.
+    aclDestroyTensor(outHalfTensor);
+#else
+    (void)q;
+    (void)kCurrent;
+    (void)vCurrent;
+    (void)kCacheKey;
+    (void)vCacheKey;
+    (void)out;
+    (void)pos;
+    (void)numHeads;
+    (void)headSize;
+    std::cerr << "[ERROR] attentionAllHeads requires ENABLE_INCRE_FLASH_ATTENTION" << std::endl;
+    exit(EXIT_FAILURE);
 #endif
 }
 

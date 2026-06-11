@@ -31,48 +31,60 @@ float* CModelForwardOpt::forward(int token, int pos) {
         backend->ropeEncoding(state->q, state->k, headSize, pos, embeddingDim, kvDim);
 
         int kvHeadDim = kvDim / config->numKvHeads;
-        for (int kvHeadIdx = 0; kvHeadIdx < config->numKvHeads; ++kvHeadIdx) {
-            float* dst_k = state->keyCache
+        if (config->numHeads == config->numKvHeads) {
+            npuBackend->attentionAllHeads(state->q,
+                                          state->k,
+                                          state->v,
+                                          state->keyCache + kvCacheOffset,
+                                          state->valueCache + kvCacheOffset,
+                                          state->branchActivation,
+                                          pos,
+                                          config->numHeads,
+                                          headSize);
+        } else {
+            for (int kvHeadIdx = 0; kvHeadIdx < config->numKvHeads; ++kvHeadIdx) {
+                float* dst_k = state->keyCache
+                             + kvCacheOffset
+                             + kvHeadIdx * config->maxSeqLen * kvHeadDim
+                             + pos * kvHeadDim;
+
+                float* src_k = state->k + kvHeadIdx * kvHeadDim;
+
+                backend->copyMemory(dst_k, src_k,
+                                    kvHeadDim * sizeof(float),
+                                    true,  // dstOnDevice
+                                    true   // srcOnDevice
+                );
+                float* dst_v = state->valueCache
+                             + kvCacheOffset
+                             + kvHeadIdx * config->maxSeqLen * kvHeadDim
+                             + pos * kvHeadDim;
+
+                float* src_v = state->v + kvHeadIdx * kvHeadDim;
+                backend->copyMemory(dst_v, src_v,
+                        kvHeadDim * sizeof(float),
+                        true,  // dstOnDevice
+                        true   // srcOnDevice
+                );
+            }
+
+            for (int headIdx = 0; headIdx < config->numHeads; ++headIdx) {
+                float* query = state->q + headIdx * headSize;
+                int kvHeadIndex = headIdx / kvHeadMultiplier;
+
+                float* k = state->keyCache
                          + kvCacheOffset
-                         + kvHeadIdx * config->maxSeqLen * kvHeadDim
-                         + pos * kvHeadDim;
+                         + kvHeadIndex * config->maxSeqLen * kvHeadDim;
 
-            float* src_k = state->k + kvHeadIdx * kvHeadDim;
-
-            backend->copyMemory(dst_k, src_k,
-                                kvHeadDim * sizeof(float),
-                                true,  // dstOnDevice
-                                true   // srcOnDevice
-            );
-            float* dst_v = state->valueCache
+                float* v = state->valueCache
                          + kvCacheOffset
-                         + kvHeadIdx * config->maxSeqLen * kvHeadDim
-                         + pos * kvHeadDim;
+                         + kvHeadIndex * config->maxSeqLen * kvHeadDim;
 
-            float* src_v = state->v + kvHeadIdx * kvHeadDim;
-            backend->copyMemory(dst_v, src_v,
-                    kvHeadDim * sizeof(float),
-                    true,  // dstOnDevice
-                    true   // srcOnDevice
-            );
-        }
+                float* out = state->branchActivation + headIdx * headSize;
+                float* scores = state->attentionScores + headIdx * config->maxSeqLen;
 
-        for (int headIdx = 0; headIdx < config->numHeads; ++headIdx) {
-            float* query = state->q + headIdx * headSize;
-            int kvHeadIndex = headIdx / kvHeadMultiplier;
-
-            float* k = state->keyCache
-                     + kvCacheOffset
-                     + kvHeadIndex * config->maxSeqLen * kvHeadDim;
-
-            float* v = state->valueCache
-                     + kvCacheOffset
-                     + kvHeadIndex * config->maxSeqLen * kvHeadDim;
-
-            float* out = state->branchActivation + headIdx * headSize;
-            float* scores = state->attentionScores + headIdx * config->maxSeqLen;
-
-            backend->attentionSingleHead(query, k, v, scores, out, pos, headSize);
+                backend->attentionSingleHead(query, k, v, scores, out, pos, headSize);
+            }
         }
 
         backend->matmul(state->extraBuffer, state->branchActivation, w.wo + layer * embeddingDim * embeddingDim, embeddingDim, embeddingDim);
