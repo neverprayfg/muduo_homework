@@ -336,12 +336,12 @@ static void* GetHalfKvCacheCurrent(CNPUBackend::Impl* impl,
 
     const bool shouldCastCurrentRow = (pos == 0 || entry.convertedUpTo < pos);
     if (shouldCastCurrentRow) {
-        int64_t rowShape[4] = {1, 1, 1, headSize};
+        int64_t rowShape[3] = {1, 1, headSize};
         float* srcRow = base + static_cast<size_t>(pos) * headSize;
         void* dstRow = static_cast<char*>(entry.addr) + static_cast<size_t>(pos) * rowBytes;
 
-        aclTensor* srcTensor = CreateTensorFromDevice(srcRow, rowShape, 4, ACL_FLOAT);
-        aclTensor* dstTensor = CreateTensorFromDevice(dstRow, rowShape, 4, ACL_FLOAT16);
+        aclTensor* srcTensor = CreateTensorFromDevice(srcRow, rowShape, 3, ACL_FLOAT);
+        aclTensor* dstTensor = CreateTensorFromDevice(dstRow, rowShape, 3, ACL_FLOAT16);
         ACL_CHECK_NOT_NULL(srcTensor);
         ACL_CHECK_NOT_NULL(dstTensor);
         RunAclnnCastTensor(srcTensor, ACL_FLOAT16, dstTensor, impl, stream,
@@ -641,12 +641,12 @@ void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, fl
 
     const int seqLen = pos + 1;
     constexpr size_t float16Bytes = 2;
-    int64_t qShape[4] = {1, 1, 1, headSize};
-    int64_t kvShape[4] = {1, 1, seqLen, headSize};
-    int64_t outShape[4] = {1, 1, 1, headSize};
+    int64_t qShape[3] = {1, 1, headSize};
+    int64_t kvShape[3] = {1, seqLen, headSize};
+    int64_t outShape[3] = {1, 1, headSize};
 
-    aclTensor* qTensor = CreateTensorFromDevice(q, qShape, 4, ACL_FLOAT);
-    aclTensor* outTensor = CreateTensorFromDevice(out, outShape, 4, ACL_FLOAT);
+    aclTensor* qTensor = CreateTensorFromDevice(q, qShape, 3, ACL_FLOAT);
+    aclTensor* outTensor = CreateTensorFromDevice(out, outShape, 3, ACL_FLOAT);
 
     void* qHalfAddr = GetTempBuffer(pImpl, 4, headSize * float16Bytes);
     void* outHalfAddr = GetTempBuffer(pImpl, 7, headSize * float16Bytes);
@@ -655,10 +655,10 @@ void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, fl
     void* vHalfAddr = GetHalfKvCacheCurrent(pImpl, vCache, pos, headSize,
                                             pImpl->stream_, 32);
 
-    aclTensor* qHalfTensor = CreateTensorFromDevice(qHalfAddr, qShape, 4, ACL_FLOAT16);
-    aclTensor* kHalfTensor = CreateTensorFromDevice(kHalfAddr, kvShape, 4, ACL_FLOAT16);
-    aclTensor* vHalfTensor = CreateTensorFromDevice(vHalfAddr, kvShape, 4, ACL_FLOAT16);
-    aclTensor* outHalfTensor = CreateTensorFromDevice(outHalfAddr, outShape, 4, ACL_FLOAT16);
+    aclTensor* qHalfTensor = CreateTensorFromDevice(qHalfAddr, qShape, 3, ACL_FLOAT16);
+    aclTensor* kHalfTensor = CreateTensorFromDevice(kHalfAddr, kvShape, 3, ACL_FLOAT16);
+    aclTensor* vHalfTensor = CreateTensorFromDevice(vHalfAddr, kvShape, 3, ACL_FLOAT16);
+    aclTensor* outHalfTensor = CreateTensorFromDevice(outHalfAddr, outShape, 3, ACL_FLOAT16);
     ACL_CHECK_NOT_NULL(qTensor);
     ACL_CHECK_NOT_NULL(outTensor);
     ACL_CHECK_NOT_NULL(qHalfTensor);
@@ -673,11 +673,8 @@ void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, fl
     aclTensor* valueTensors[1] = {vHalfTensor};
     aclTensorList* keyTensorList = aclCreateTensorList(keyTensors, 1);
     aclTensorList* valueTensorList = aclCreateTensorList(valueTensors, 1);
-    int64_t actualSeqLen = seqLen;
-    aclIntArray* actualSeqLengths = aclCreateIntArray(&actualSeqLen, 1);
     ACL_CHECK_NOT_NULL(keyTensorList);
     ACL_CHECK_NOT_NULL(valueTensorList);
-    ACL_CHECK_NOT_NULL(actualSeqLengths);
 
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor = nullptr;
@@ -685,9 +682,9 @@ void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, fl
     // CANN IncreFlashAttention docs require 0 for Atlas inference devices.
     constexpr int64_t numKeyValueHeads = 0;
     const double scaleValue = 1.0 / std::sqrt(static_cast<double>(headSize));
-    char inputLayout[] = "BNSD";
+    char inputLayout[] = "BSH";
     ACL_CHECK(aclnnIncreFlashAttentionGetWorkspaceSize(qHalfTensor, keyTensorList, valueTensorList,
-                                                       nullptr, nullptr, actualSeqLengths,
+                                                       nullptr, nullptr, nullptr,
                                                        numHeads, scaleValue, inputLayout,
                                                        numKeyValueHeads, outHalfTensor,
                                                        &workspaceSize, &executor));
@@ -699,7 +696,6 @@ void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, fl
 
     aclDestroyTensorList(keyTensorList);
     aclDestroyTensorList(valueTensorList);
-    aclDestroyIntArray(actualSeqLengths);
     aclDestroyTensor(qTensor);
     aclDestroyTensor(outTensor);
     aclDestroyTensor(qHalfTensor);
