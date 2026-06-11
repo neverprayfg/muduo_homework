@@ -699,8 +699,7 @@ void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, fl
     aclDestroyTensor(qTensor);
     aclDestroyTensor(outTensor);
     aclDestroyTensor(qHalfTensor);
-    aclDestroyTensor(kHalfTensor);
-    aclDestroyTensor(vHalfTensor);
+    // aclDestroyTensorList releases the tensor descriptors it contains.
     aclDestroyTensor(outHalfTensor);
 #else
     const int seqLen = pos + 1;
