@@ -31,6 +31,15 @@
     }                                                       \
 }
 
+#define ACL_CHECK_NOT_NULL(ptr) {                           \
+    if ((ptr) == nullptr) {                                 \
+        std::cerr << "[ACL ERROR] " << #ptr                 \
+                  << " is nullptr at " << __FILE__          \
+                  << ":" << __LINE__ << std::endl;          \
+        exit(EXIT_FAILURE);                                 \
+    }                                                       \
+}
+
 
 #define CHECK_RET(ret, expr) \
     if (ret != ACL_SUCCESS) { \
@@ -326,7 +335,7 @@ static void* GetHalfKvCacheCurrent(CNPUBackend::Impl* impl,
         aclTensor* srcTensor = CreateTensorFromDevice(srcRow, rowShape, 4, ACL_FLOAT);
         aclTensor* dstTensor = CreateTensorFromDevice(dstRow, rowShape, 4, ACL_FLOAT16);
         RunAclnnCastTensor(srcTensor, ACL_FLOAT16, dstTensor, impl, stream,
-                           false, castWorkspaceSlot);
+                           true, castWorkspaceSlot);
         aclDestroyTensor(srcTensor);
         aclDestroyTensor(dstTensor);
         entry.convertedUpTo = pos;
@@ -619,6 +628,12 @@ void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, fl
     aclTensor* kHalfTensor = CreateTensorFromDevice(kHalfAddr, kvShape, 4, ACL_FLOAT16);
     aclTensor* vHalfTensor = CreateTensorFromDevice(vHalfAddr, kvShape, 4, ACL_FLOAT16);
     aclTensor* outHalfTensor = CreateTensorFromDevice(outHalfAddr, outShape, 4, ACL_FLOAT16);
+    ACL_CHECK_NOT_NULL(qTensor);
+    ACL_CHECK_NOT_NULL(outTensor);
+    ACL_CHECK_NOT_NULL(qHalfTensor);
+    ACL_CHECK_NOT_NULL(kHalfTensor);
+    ACL_CHECK_NOT_NULL(vHalfTensor);
+    ACL_CHECK_NOT_NULL(outHalfTensor);
 
     RunAclnnCastTensor(qTensor, ACL_FLOAT16, qHalfTensor, pImpl, pImpl->stream_,
                        false, 30);
@@ -629,6 +644,9 @@ void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, fl
     aclTensorList* valueTensorList = aclCreateTensorList(valueTensors, 1);
     int64_t actualSeqLen = seqLen;
     aclIntArray* actualSeqLengths = aclCreateIntArray(&actualSeqLen, 1);
+    ACL_CHECK_NOT_NULL(keyTensorList);
+    ACL_CHECK_NOT_NULL(valueTensorList);
+    ACL_CHECK_NOT_NULL(actualSeqLengths);
 
     uint64_t workspaceSize = 0;
     aclOpExecutor* executor = nullptr;
