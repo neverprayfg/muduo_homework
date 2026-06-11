@@ -51,6 +51,10 @@
     printf((message), ##__VA_ARGS__); \
     fflush(stdout);
 
+#ifndef ENABLE_ADD_RMS_NORM
+#define ENABLE_ADD_RMS_NORM 1
+#endif
+
 constexpr size_t kDefaultWorkspaceSlot = static_cast<size_t>(-1);
 
 struct CNPUBackend::Impl {
@@ -470,6 +474,7 @@ void CNPUBackend::rmsnorm(float *y, float *x, float *w, int n) {
 void CNPUBackend::addRmsNorm(float* y, float* xOut, float* x1, float* x2, float* w, int n) {
     ACL_CHECK(aclrtSetCurrentContext(pImpl->context_));
 
+#if ENABLE_ADD_RMS_NORM
     int64_t xShape[2] = {1, n};
     int64_t wShape[1] = {n};
     int64_t rstdShape[1] = {1};
@@ -505,6 +510,24 @@ void CNPUBackend::addRmsNorm(float* y, float* xOut, float* x1, float* x2, float*
     aclDestroyTensor(yTensor);
     aclDestroyTensor(xOutTensor);
     aclDestroyTensor(rstdTensor);
+#else
+    float* sum = xOut;
+    if (xOut == x2) {
+        sum = static_cast<float*>(GetTempBuffer(pImpl, 8, n * sizeof(float)));
+    }
+    if (sum != x1) {
+        ACL_CHECK(aclrtMemcpy(sum, n * sizeof(float),
+                              x1, n * sizeof(float),
+                              ACL_MEMCPY_DEVICE_TO_DEVICE));
+    }
+    axpy(sum, x2, 1.0f, n);
+    if (sum != xOut) {
+        ACL_CHECK(aclrtMemcpy(xOut, n * sizeof(float),
+                              sum, n * sizeof(float),
+                              ACL_MEMCPY_DEVICE_TO_DEVICE));
+    }
+    rmsnorm(y, xOut, w, n);
+#endif
 }
 
 /*  TODO
@@ -606,6 +629,8 @@ void CNPUBackend::swiGLLUFunc(float* headOutput, float* value, int hiddenDim) {
 
 void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, float* attnScores, float* out, int pos, int headSize) {
     ACL_CHECK(aclrtSetCurrentContext(pImpl->context_));
+
+#ifdef ENABLE_INCRE_FLASH_ATTENTION
     (void)attnScores;
 
     const int seqLen = pos + 1;
@@ -674,6 +699,48 @@ void CNPUBackend::attentionSingleHead(float* q, float* kCache, float* vCache, fl
     aclDestroyTensor(kHalfTensor);
     aclDestroyTensor(vHalfTensor);
     aclDestroyTensor(outHalfTensor);
+#else
+    const int seqLen = pos + 1;
+    int64_t qShape[2] = {1, headSize};
+    int64_t scoreShape[2] = {1, seqLen};
+    int64_t scaleShape[2] = {1, 1};
+    int64_t kViewShape[2] = {headSize, seqLen};
+    int64_t kStrides[2] = {1, headSize};
+    int64_t kStorageShape[2] = {seqLen, headSize};
+    int64_t vShape[2] = {seqLen, headSize};
+    int64_t outShape[2] = {1, headSize};
+
+    void* rawScoreAddr = GetTempBuffer(pImpl, 4, seqLen * sizeof(float));
+    void* scaledScoreAddr = GetTempBuffer(pImpl, 5, seqLen * sizeof(float));
+    void* scaleAddr = GetTempBuffer(pImpl, 6, sizeof(float));
+    const float scaleValue = 1.0f / std::sqrt(static_cast<float>(headSize));
+    ACL_CHECK(aclrtMemcpy(scaleAddr, sizeof(float), &scaleValue, sizeof(float),
+                          ACL_MEMCPY_HOST_TO_DEVICE));
+
+    aclTensor* qTensor = CreateTensorFromDevice(q, qShape, 2, ACL_FLOAT);
+    aclTensor* kTensor = CreateTensorFromDeviceWithStrides(kCache, kViewShape, kStrides,
+                                                           kStorageShape, 2, ACL_FLOAT);
+    aclTensor* rawScoreTensor = CreateTensorFromDevice(rawScoreAddr, scoreShape, 2, ACL_FLOAT);
+    aclTensor* scaleTensor = CreateTensorFromDevice(scaleAddr, scaleShape, 2, ACL_FLOAT);
+    aclTensor* scaledScoreTensor = CreateTensorFromDevice(scaledScoreAddr, scoreShape, 2, ACL_FLOAT);
+    aclTensor* scoreTensor = CreateTensorFromDevice(attnScores, scoreShape, 2, ACL_FLOAT);
+    aclTensor* vTensor = CreateTensorFromDevice(vCache, vShape, 2, ACL_FLOAT);
+    aclTensor* outTensor = CreateTensorFromDevice(out, outShape, 2, ACL_FLOAT);
+
+    RunAclnnMatmulTensor(qTensor, kTensor, rawScoreTensor, pImpl, pImpl->stream_);
+    RunAclnnMulTensor(rawScoreTensor, scaleTensor, scaledScoreTensor, pImpl, pImpl->stream_);
+    RunAclnnSoftmaxTensor(scaledScoreTensor, 1, scoreTensor, pImpl, pImpl->stream_);
+    RunAclnnMatmulTensor(scoreTensor, vTensor, outTensor, pImpl, pImpl->stream_);
+
+    aclDestroyTensor(qTensor);
+    aclDestroyTensor(kTensor);
+    aclDestroyTensor(rawScoreTensor);
+    aclDestroyTensor(scaleTensor);
+    aclDestroyTensor(scaledScoreTensor);
+    aclDestroyTensor(scoreTensor);
+    aclDestroyTensor(vTensor);
+    aclDestroyTensor(outTensor);
+#endif
 }
 
 void* CNPUBackend::allocMemory(size_t size) {
